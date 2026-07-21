@@ -1,16 +1,19 @@
 {
-	"compatibility_date": "2025-10-08",
-	"main": "src/index.ts",
-	"name": "igstore-whatsapp-bot",
-	"upload_source_maps": true,
-	"observability": {
-		"enabled": true
-	},
-	"d1_databases": [
-		{
-			"binding": "DB",
-			"database_name": "openapi-template-db",
-			"database_id": "004b2d1b-e003-48d6-baca-43a29e96d31f"
-		}
-	]
+  "compatibility_date": "2025-10-08",
+  "main": "src/index.ts",
+  "name": "igstore-whatsapp-bot",
+  "upload_source_maps": true,
+  "observability": {
+    "enabled": true
+  },
+  "triggers": {
+    "crons": ["*/15 * * * *"]
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "openapi-template-db",
+      "database_id": "004b2d1b-e003-48d6-baca-43a29e96d31f"
+    }
+  ]
 }
