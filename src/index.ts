@@ -2136,14 +2136,27 @@ async function handleTrackingFlow(
   }
 
   const order = await findShopifyOrder(env, phone, orderNumber);
-  await env.DB.prepare("DELETE FROM order_tracking_context WHERE phone = ?")
-    .bind(phone)
-    .run();
 
   if (!order) {
+    // Keep tracking mode active after an unsuccessful lookup. Previously the
+    // context was deleted here, so the customer's next numeric reply (for
+    // example "4510") fell through to product search.
+    await env.DB.prepare(`
+      INSERT INTO order_tracking_context (phone, pending, updated_at)
+      VALUES (?, 1, CURRENT_TIMESTAMP)
+      ON CONFLICT(phone) DO UPDATE SET pending = 1, updated_at = CURRENT_TIMESTAMP
+    `)
+      .bind(phone)
+      .run();
+
     await replyAndLog(env, phone, orderNotFoundMessage(language, orderNumber));
     return true;
   }
+
+  // Clear tracking mode only after a valid order has been found.
+  await env.DB.prepare("DELETE FROM order_tracking_context WHERE phone = ?")
+    .bind(phone)
+    .run();
 
   await replyAndLog(env, phone, formatOrderStatusMessage(language, order));
   return true;
@@ -2481,12 +2494,12 @@ function graphqlStatusToRest(value: string | null | undefined): string {
 
 function orderNotFoundMessage(language: Language, orderNumber: string): string {
   if (language === "hi") {
-    return `ऑर्डर #${orderNumber} नहीं मिला। कृपया Shopify confirmation में दिख रहा केवल 4 अंकों वाला order number भेजें, जैसे *4621* या *#4621*।`;
+    return `ऑर्डर #${orderNumber} अभी verify नहीं हो पाया। Tracking mode चालू है—दूसरा order number भेजें या *menu* लिखें।`;
   }
   if (language === "en") {
-    return `Order #${orderNumber} was not found. Please send the 4-digit order number shown in your Shopify confirmation, for example *4621* or *#4621*.`;
+    return `Order #${orderNumber} could not be verified yet. Tracking mode is still active—send another order number or type *menu*.`;
   }
-  return `Order #${orderNumber} nahi mila. Shopify confirmation mein dikh raha 4-digit order number bhejein, jaise *4621* ya *#4621*.`;
+  return `Order #${orderNumber} abhi verify nahi ho paya. Tracking mode active hai—dusra order number bhejein ya *menu* likhein.`;
 }
 
 function formatOrderStatusMessage(language: Language, order: ShopifyOrderRow): string {
