@@ -9,6 +9,10 @@ type Bindings = {
   WHATSAPP_PHONE_NUMBER_ID: string;
   META_GRAPH_VERSION?: string;
   SHOP_DOMAIN?: string;
+  SHOPIFY_WEBHOOK_TOKEN?: string;
+  ABANDONED_TEMPLATE_NAME?: string;
+  ABANDONED_TEMPLATE_LANGUAGE?: string;
+  ABANDONED_FALLBACK_IMAGE_URL?: string;
 };
 
 type BotUser = {
@@ -22,6 +26,11 @@ type ProductSuggestion = {
   price?: string | number;
   price_min?: string | number;
   available?: boolean;
+  image?: string;
+  featured_image?: {
+    url?: string;
+    alt?: string;
+  } | string;
 };
 
 type Category = {
@@ -31,10 +40,41 @@ type Category = {
   labelHi: string;
 };
 
+type AbandonedCheckoutRow = {
+  checkout_token: string;
+  phone: string;
+  customer_name: string;
+  product_title: string;
+  product_image: string | null;
+  total_price: number;
+  currency: string;
+  recovery_url: string;
+  consent: number;
+  status: string;
+  due_at: number;
+  attempts: number;
+};
+
+type ShopifyLineItem = {
+  title?: string;
+  presentment_title?: string;
+  quantity?: number;
+  product_id?: string | number;
+  image_url?: string;
+  image?: string | { src?: string; url?: string };
+};
+
 const app = new Hono<{ Bindings: Bindings }>();
 
 const DEFAULT_SHOP_DOMAIN = "https://igstore.in";
 const SUPPORT_PHONE = "+91 95876 66693";
+const ABANDONED_DELAY_MINUTES = 45;
+const ABANDONED_MINIMUM_AMOUNT = 499;
+const ABANDONED_OFFER_CODE = "COMPLETE5";
+const DEFAULT_ABANDONED_TEMPLATE = "abandoned_checkout_offer";
+const DEFAULT_TEMPLATE_LANGUAGE = "en_US";
+const DEFAULT_FALLBACK_IMAGE =
+  "https://cdn.shopify.com/s/files/1/0600/1383/8379/collections/best-sellers-collection.jpg?v=1783692206";
 
 const CATEGORIES: Record<string, Category> = {
   "1": {
@@ -112,6 +152,62 @@ app.post("/webhook", async (c) => {
   console.log("Incoming webhook received");
   c.executionCtx.waitUntil(processWebhook(c.env, payload));
   return c.text("EVENT_RECEIVED", 200);
+});
+
+app.post("/shopify/webhook", async (c) => {
+  if (!isAuthorizedShopifyWebhook(c.env, c.req.query("token"))) {
+    console.warn("Rejected unauthorized Shopify webhook");
+    return c.text("Forbidden", 403);
+  }
+
+  const topic = (c.req.header("X-Shopify-Topic") || "").toLowerCase();
+  const webhookId = c.req.header("X-Shopify-Webhook-Id") || crypto.randomUUID();
+  const rawBody = await c.req.text();
+
+  let payload: any;
+  try {
+    payload = JSON.parse(rawBody);
+  } catch (error) {
+    console.error("Invalid Shopify webhook JSON:", error);
+    return c.text("Bad Request", 400);
+  }
+
+  console.log("Shopify webhook received:", topic, webhookId);
+  c.executionCtx.waitUntil(
+    processShopifyWebhook(c.env, topic, webhookId, payload),
+  );
+  return c.text("OK", 200);
+});
+
+app.get("/shopify/health", async (c) => {
+  await initializeDatabase(c.env);
+  const counts = await c.env.DB.prepare(`
+    SELECT
+      SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pending,
+      SUM(CASE WHEN status = 'sent' THEN 1 ELSE 0 END) AS sent,
+      SUM(CASE WHEN status = 'recovered' THEN 1 ELSE 0 END) AS recovered,
+      SUM(CASE WHEN status = 'skipped' THEN 1 ELSE 0 END) AS skipped,
+      SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed
+    FROM abandoned_checkouts
+  `).first();
+
+  return c.json({
+    ok: true,
+    automation: "abandoned-checkout",
+    delayMinutes: ABANDONED_DELAY_MINUTES,
+    minimumAmount: ABANDONED_MINIMUM_AMOUNT,
+    offerCode: ABANDONED_OFFER_CODE,
+    counts: counts ?? {},
+  });
+});
+
+app.post("/shopify/run-abandoned", async (c) => {
+  if (!isAuthorizedShopifyWebhook(c.env, c.req.query("token"))) {
+    return c.text("Forbidden", 403);
+  }
+
+  c.executionCtx.waitUntil(processDueAbandonedCheckouts(c.env));
+  return c.json({ ok: true, started: true });
 });
 
 app.onError((error, c) => {
@@ -224,14 +320,21 @@ async function processMessage(env: Bindings, message: any): Promise<void> {
     await replyAndLog(
       env,
       from,
-      categoryMessage(user.language, category, products, shopDomain(env)),
+      categoryIntroMessage(user.language, category, shopDomain(env)),
     );
+
+    if (products.length > 0) {
+      await sendProductCards(env, from, user.language, products.slice(0, 3));
+    } else {
+      await replyAndLog(env, from, noCategoryProductsMessage(user.language));
+    }
     return;
   }
 
   const products = await searchProducts(env, text);
   if (products.length > 0) {
-    await replyAndLog(env, from, productResultsMessage(user.language, products, shopDomain(env)));
+    await replyAndLog(env, from, productSearchIntro(user.language));
+    await sendProductCards(env, from, user.language, products.slice(0, 3));
     return;
   }
 
@@ -342,38 +445,15 @@ async function searchProducts(env: Bindings, query: string): Promise<ProductSugg
   }
 }
 
-function productResultsMessage(
-  language: Language,
-  products: ProductSuggestion[],
-  domain: string,
-): string {
-  const lines = products.slice(0, 5).map((product, index) => {
-    const price = formatPrice(product.price_min ?? product.price);
-    const url = absoluteUrl(domain, product.url);
-    return `${index + 1}. *${product.title}*\n${price ? `Starting price: ${price}\n` : ""}${url}`;
-  });
-
-  if (language === "hi") {
-    return `आपके लिए ये प्रोडक्ट मिले 🎁\n\n${lines.join(
-      "\n\n",
-    )}\n\nऑर्डर करने के लिए प्रोडक्ट लिंक खोलें। मुख्य मेनू के लिए *Menu* लिखें।`;
-  }
-
-  if (language === "en") {
-    return `Here are the matching products 🎁\n\n${lines.join(
-      "\n\n",
-    )}\n\nOpen a product link to order. Reply *Menu* for the main menu.`;
-  }
-
-  return `Matching products / आपके लिए प्रोडक्ट 🎁\n\n${lines.join(
-    "\n\n",
-  )}\n\nOpen the product link to order.\nऑर्डर के लिए प्रोडक्ट लिंक खोलें।\n\nReply *Menu* for the main menu.`;
+function productSearchIntro(language: Language): string {
+  if (language === "hi") return "आपके लिए ये प्रोडक्ट मिले 🎁";
+  if (language === "en") return "Here are the matching products 🎁";
+  return "Matching products / आपके लिए प्रोडक्ट 🎁";
 }
 
-function categoryMessage(
+function categoryIntroMessage(
   language: Language,
   category: Category,
-  products: ProductSuggestion[],
   domain: string,
 ): string {
   const heading =
@@ -383,10 +463,6 @@ function categoryMessage(
         ? `*${category.labelHi}*`
         : `*${category.labelEn} / ${category.labelHi}*`;
 
-  const results = products.length
-    ? `\n\n${productResultsMessage(language, products.slice(0, 3), domain)}`
-    : "";
-
   const browseLabel =
     language === "hi"
       ? "सभी प्रोडक्ट देखें"
@@ -394,7 +470,86 @@ function categoryMessage(
         ? "Browse all products"
         : "Browse all products / सभी प्रोडक्ट देखें";
 
-  return `${heading}\n${browseLabel}:\n${absoluteUrl(domain, category.collectionUrl)}${results}`;
+  return `${heading}
+${browseLabel}:
+${absoluteUrl(domain, category.collectionUrl)}
+
+Top products with images:`;
+}
+
+function noCategoryProductsMessage(language: Language): string {
+  if (language === "hi") return "इस कैटेगरी में अभी कोई प्रोडक्ट नहीं मिला। कृपया ऊपर दिया collection link खोलें।";
+  if (language === "en") return "No products were found in this category right now. Please open the collection link above.";
+  return "No products found right now. / अभी कोई प्रोडक्ट नहीं मिला। कृपया ऊपर दिया collection link खोलें।";
+}
+
+async function sendProductCards(
+  env: Bindings,
+  phone: string,
+  language: Language,
+  products: ProductSuggestion[],
+): Promise<void> {
+  for (const product of products) {
+    const caption = productCaption(language, product, shopDomain(env));
+    const imageUrl = productImageUrl(product);
+
+    if (imageUrl) {
+      try {
+        await sendImage(env, phone, imageUrl, caption);
+        await saveConversation(env, phone, "out", `[image] ${caption}`, null);
+        continue;
+      } catch (error) {
+        console.error("Product image send failed; falling back to text:", error);
+      }
+    }
+
+    await replyAndLog(env, phone, caption);
+  }
+
+  await replyAndLog(env, phone, productCardsFooter(language));
+}
+
+function productCaption(
+  language: Language,
+  product: ProductSuggestion,
+  domain: string,
+): string {
+  const price = formatPrice(product.price_min ?? product.price);
+  const url = absoluteUrl(domain, product.url);
+
+  if (language === "hi") {
+    return `*${product.title}*
+${price ? `शुरुआती कीमत: ${price}
+` : ""}ऑर्डर करें: ${url}`;
+  }
+
+  if (language === "en") {
+    return `*${product.title}*
+${price ? `Starting price: ${price}
+` : ""}Order now: ${url}`;
+  }
+
+  return `*${product.title}*
+${price ? `Starting price / शुरुआती कीमत: ${price}
+` : ""}Order now / ऑर्डर करें: ${url}`;
+}
+
+function productImageUrl(product: ProductSuggestion): string | null {
+  const featured = product.featured_image;
+  const url =
+    typeof featured === "string"
+      ? featured
+      : featured?.url ?? product.image;
+
+  if (!url || !/^https:\/\//i.test(url)) return null;
+  return url;
+}
+
+function productCardsFooter(language: Language): string {
+  if (language === "hi") return "मुख्य मेनू के लिए *Menu* लिखें या किसी दूसरे प्रोडक्ट का नाम भेजें।";
+  if (language === "en") return "Reply *Menu* for the main menu or send another product name.";
+  return `Reply *Menu* for the main menu or send another product name.
+मुख्य मेनू के लिए *Menu* लिखें।`;
 }
 
 function formatPrice(value: unknown): string | null {
@@ -509,6 +664,433 @@ function noProductFoundMessage(language: Language, query: string): string {
   return `No exact product found for “${safeQuery}”.\n“${safeQuery}” के लिए सही प्रोडक्ट नहीं मिला।\n\nTry a shorter product name or reply *9* for support.`;
 }
 
+function isAuthorizedShopifyWebhook(
+  env: Bindings,
+  suppliedToken: string | undefined,
+): boolean {
+  const expected = env.SHOPIFY_WEBHOOK_TOKEN?.trim();
+  return Boolean(expected && suppliedToken && timingSafeEqual(expected, suppliedToken));
+}
+
+function timingSafeEqual(a: string, b: string): boolean {
+  const aBytes = new TextEncoder().encode(a);
+  const bBytes = new TextEncoder().encode(b);
+  if (aBytes.length !== bBytes.length) return false;
+
+  let difference = 0;
+  for (let index = 0; index < aBytes.length; index += 1) {
+    difference |= aBytes[index] ^ bBytes[index];
+  }
+  return difference === 0;
+}
+
+async function processShopifyWebhook(
+  env: Bindings,
+  topic: string,
+  webhookId: string,
+  payload: any,
+): Promise<void> {
+  try {
+    await initializeDatabase(env);
+
+    if (!(await markShopifyWebhookAsNew(env, webhookId))) {
+      console.log("Duplicate Shopify webhook ignored:", webhookId);
+      return;
+    }
+
+    if (topic === "checkouts/create" || topic === "checkouts/update") {
+      await upsertAbandonedCheckout(env, payload);
+      return;
+    }
+
+    if (
+      topic === "orders/create" ||
+      topic === "orders/paid" ||
+      topic === "orders/updated"
+    ) {
+      await markCheckoutRecovered(env, String(payload?.checkout_token ?? ""));
+      return;
+    }
+
+    console.log("Shopify topic ignored:", topic);
+  } catch (error) {
+    console.error("Shopify webhook processing failed:", error);
+  }
+}
+
+async function markShopifyWebhookAsNew(
+  env: Bindings,
+  webhookId: string,
+): Promise<boolean> {
+  const result = await env.DB.prepare(
+    "INSERT OR IGNORE INTO processed_shopify_webhooks (webhook_id) VALUES (?)",
+  )
+    .bind(webhookId)
+    .run();
+
+  return Number(result.meta?.changes ?? 0) > 0;
+}
+
+async function upsertAbandonedCheckout(env: Bindings, payload: any): Promise<void> {
+  const checkoutToken = String(payload?.token ?? "").trim();
+  if (!checkoutToken) {
+    console.warn("Checkout webhook skipped because token is missing");
+    return;
+  }
+
+  if (payload?.completed_at) {
+    await markCheckoutRecovered(env, checkoutToken);
+    return;
+  }
+
+  const lineItems: ShopifyLineItem[] = Array.isArray(payload?.line_items)
+    ? payload.line_items
+    : [];
+  if (lineItems.length === 0) {
+    console.log("Checkout skipped because cart has no line items:", checkoutToken);
+    return;
+  }
+
+  const totalPrice = Number(payload?.total_price ?? payload?.subtotal_price ?? 0);
+  const recoveryUrl = String(payload?.abandoned_checkout_url ?? "").trim();
+  const phone = checkoutPhone(payload);
+  const consent = hasWhatsAppMarketingConsent(payload);
+  const customerName = checkoutCustomerName(payload);
+  const productTitle = checkoutProductTitle(lineItems);
+  const productImage =
+    directLineItemImage(lineItems[0]) ??
+    (await findProductImage(
+      env,
+      lineItems[0]?.title ?? lineItems[0]?.presentment_title ?? "",
+    ));
+  const now = Date.now();
+  const dueAt = now + ABANDONED_DELAY_MINUTES * 60_000;
+
+  const alreadyRecovered = await env.DB.prepare(
+    "SELECT checkout_token FROM recovered_checkout_tokens WHERE checkout_token = ? LIMIT 1",
+  )
+    .bind(checkoutToken)
+    .first();
+  if (alreadyRecovered) return;
+
+  const existing = await env.DB.prepare(
+    "SELECT status FROM abandoned_checkouts WHERE checkout_token = ? LIMIT 1",
+  )
+    .bind(checkoutToken)
+    .first<{ status: string }>();
+
+  if (existing?.status === "sent" || existing?.status === "recovered") {
+    return;
+  }
+
+  let status = "pending";
+  let skipReason: string | null = null;
+
+  if (!phone) {
+    status = "skipped";
+    skipReason = "phone_missing";
+  } else if (!consent) {
+    status = "skipped";
+    skipReason = "whatsapp_marketing_opt_in_missing";
+  } else if (!recoveryUrl) {
+    status = "skipped";
+    skipReason = "recovery_url_missing";
+  } else if (!Number.isFinite(totalPrice) || totalPrice < ABANDONED_MINIMUM_AMOUNT) {
+    status = "skipped";
+    skipReason = "below_minimum_amount";
+  }
+
+  await env.DB.prepare(`
+    INSERT INTO abandoned_checkouts (
+      checkout_token, phone, customer_name, product_title, product_image,
+      total_price, currency, recovery_url, consent, status, skip_reason,
+      due_at, attempts, created_at, updated_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+    ON CONFLICT(checkout_token) DO UPDATE SET
+      phone = excluded.phone,
+      customer_name = excluded.customer_name,
+      product_title = excluded.product_title,
+      product_image = excluded.product_image,
+      total_price = excluded.total_price,
+      currency = excluded.currency,
+      recovery_url = excluded.recovery_url,
+      consent = excluded.consent,
+      status = excluded.status,
+      skip_reason = excluded.skip_reason,
+      due_at = excluded.due_at,
+      updated_at = excluded.updated_at
+  `)
+    .bind(
+      checkoutToken,
+      phone ?? "",
+      customerName,
+      productTitle,
+      productImage,
+      totalPrice,
+      String(payload?.currency ?? "INR"),
+      recoveryUrl,
+      consent ? 1 : 0,
+      status,
+      skipReason,
+      dueAt,
+      now,
+      now,
+    )
+    .run();
+
+  console.log("Checkout stored:", checkoutToken, status, skipReason ?? "");
+}
+
+function checkoutPhone(payload: any): string | null {
+  const candidates = [
+    payload?.sms_marketing_phone,
+    payload?.phone,
+    payload?.shipping_address?.phone,
+    payload?.billing_address?.phone,
+    payload?.customer?.phone,
+  ];
+
+  for (const value of candidates) {
+    const normalized = normalizeWhatsAppPhone(String(value ?? ""));
+    if (normalized) return normalized;
+  }
+
+  return null;
+}
+
+function normalizeWhatsAppPhone(value: string): string | null {
+  let digits = value.replace(/\D/g, "");
+  if (!digits) return null;
+
+  if (digits.startsWith("00")) digits = digits.slice(2);
+  if (digits.length === 10) digits = `91${digits}`;
+  if (digits.length === 11 && digits.startsWith("0")) {
+    digits = `91${digits.slice(1)}`;
+  }
+
+  if (digits.length < 11 || digits.length > 15) return null;
+  return digits;
+}
+
+function hasWhatsAppMarketingConsent(payload: any): boolean {
+  if (payload?.buyer_accepts_sms_marketing === true) return true;
+
+  const attributes = Array.isArray(payload?.note_attributes)
+    ? payload.note_attributes
+    : [];
+
+  return attributes.some((attribute: any) => {
+    const name = normalize(String(attribute?.name ?? ""));
+    const value = normalize(String(attribute?.value ?? ""));
+    const consentField =
+      name === "whatsapp opt in" ||
+      name === "whatsapp_opt_in" ||
+      name === "whatsapp marketing consent";
+
+    return consentField && ["yes", "true", "1", "accepted"].includes(value);
+  });
+}
+
+function checkoutCustomerName(payload: any): string {
+  const name =
+    payload?.customer?.first_name ??
+    payload?.shipping_address?.first_name ??
+    payload?.billing_address?.first_name ??
+    "there";
+
+  return String(name).trim().slice(0, 80) || "there";
+}
+
+function checkoutProductTitle(lineItems: ShopifyLineItem[]): string {
+  const first =
+    lineItems[0]?.title ??
+    lineItems[0]?.presentment_title ??
+    "your selected product";
+  const more = lineItems.length - 1;
+  return more > 0 ? `${String(first)} + ${more} more` : String(first);
+}
+
+function directLineItemImage(item: ShopifyLineItem | undefined): string | null {
+  if (!item) return null;
+
+  const image =
+    item.image_url ??
+    (typeof item.image === "string"
+      ? item.image
+      : item.image?.url ?? item.image?.src);
+
+  return image && /^https:\/\//i.test(image) ? image : null;
+}
+
+async function findProductImage(env: Bindings, title: string): Promise<string | null> {
+  if (!title.trim()) return null;
+  const products = await searchProducts(env, title);
+  return products.length > 0 ? productImageUrl(products[0]) : null;
+}
+
+async function markCheckoutRecovered(
+  env: Bindings,
+  checkoutToken: string,
+): Promise<void> {
+  if (!checkoutToken) return;
+
+  const now = Date.now();
+
+  await env.DB.prepare(`
+    INSERT OR IGNORE INTO recovered_checkout_tokens (checkout_token, recovered_at)
+    VALUES (?, ?)
+  `)
+    .bind(checkoutToken, now)
+    .run();
+
+  await env.DB.prepare(`
+    UPDATE abandoned_checkouts
+    SET status = 'recovered', recovered_at = ?, updated_at = ?
+    WHERE checkout_token = ? AND status != 'sent'
+  `)
+    .bind(now, now, checkoutToken)
+    .run();
+
+  console.log("Checkout marked recovered:", checkoutToken);
+}
+
+async function processDueAbandonedCheckouts(env: Bindings): Promise<void> {
+  await initializeDatabase(env);
+
+  const now = Date.now();
+  const result = await env.DB.prepare(`
+    SELECT
+      checkout_token, phone, customer_name, product_title, product_image,
+      total_price, currency, recovery_url, consent, status, due_at, attempts
+    FROM abandoned_checkouts
+    WHERE status = 'pending' AND due_at <= ?
+    ORDER BY due_at ASC
+    LIMIT 25
+  `)
+    .bind(now)
+    .all<AbandonedCheckoutRow>();
+
+  for (const checkout of result.results ?? []) {
+    try {
+      await sendAbandonedCheckoutTemplate(env, checkout);
+      await env.DB.prepare(`
+        UPDATE abandoned_checkouts
+        SET status = 'sent', sent_at = ?, updated_at = ?, last_error = NULL
+        WHERE checkout_token = ? AND status = 'pending'
+      `)
+        .bind(Date.now(), Date.now(), checkout.checkout_token)
+        .run();
+
+      await saveConversation(
+        env,
+        checkout.phone,
+        "out",
+        `[template:${env.ABANDONED_TEMPLATE_NAME?.trim() || DEFAULT_ABANDONED_TEMPLATE}] ${checkout.product_title}`,
+        null,
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const nextAttempts = Number(checkout.attempts ?? 0) + 1;
+      const nextStatus = nextAttempts >= 3 ? "failed" : "pending";
+      const nextDueAt = Date.now() + 30 * 60_000;
+
+      await env.DB.prepare(`
+        UPDATE abandoned_checkouts
+        SET status = ?, attempts = ?, due_at = ?, last_error = ?, updated_at = ?
+        WHERE checkout_token = ?
+      `)
+        .bind(
+          nextStatus,
+          nextAttempts,
+          nextDueAt,
+          message.slice(0, 1000),
+          Date.now(),
+          checkout.checkout_token,
+        )
+        .run();
+
+      console.error("Abandoned checkout send failed:", checkout.checkout_token, message);
+    }
+  }
+}
+
+async function sendAbandonedCheckoutTemplate(
+  env: Bindings,
+  checkout: AbandonedCheckoutRow,
+): Promise<void> {
+  if (!checkout.phone || !checkout.recovery_url || checkout.consent !== 1) {
+    throw new Error("Checkout is missing phone, recovery URL or consent");
+  }
+
+  const graphVersion = env.META_GRAPH_VERSION?.trim() || "v25.0";
+  const endpoint = `https://graph.facebook.com/${graphVersion}/${env.WHATSAPP_PHONE_NUMBER_ID}/messages`;
+  const imageUrl =
+    checkout.product_image ||
+    env.ABANDONED_FALLBACK_IMAGE_URL?.trim() ||
+    DEFAULT_FALLBACK_IMAGE;
+  const total = formatCheckoutAmount(checkout.total_price, checkout.currency);
+
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${env.WHATSAPP_ACCESS_TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      messaging_product: "whatsapp",
+      recipient_type: "individual",
+      to: checkout.phone,
+      type: "template",
+      template: {
+        name: env.ABANDONED_TEMPLATE_NAME?.trim() || DEFAULT_ABANDONED_TEMPLATE,
+        language: {
+          code:
+            env.ABANDONED_TEMPLATE_LANGUAGE?.trim() ||
+            DEFAULT_TEMPLATE_LANGUAGE,
+        },
+        components: [
+          {
+            type: "header",
+            parameters: [
+              {
+                type: "image",
+                image: { link: imageUrl },
+              },
+            ],
+          },
+          {
+            type: "body",
+            parameters: [
+              { type: "text", text: checkout.customer_name.slice(0, 80) },
+              { type: "text", text: checkout.product_title.slice(0, 160) },
+              { type: "text", text: total },
+              { type: "text", text: checkout.recovery_url.slice(0, 1900) },
+            ],
+          },
+        ],
+      },
+    }),
+  });
+
+  const responseBody = await response.text();
+  console.log(`Abandoned template status: ${response.status}`, responseBody);
+
+  if (!response.ok) {
+    throw new Error(
+      `WhatsApp template failed (${response.status}): ${responseBody.slice(0, 500)}`,
+    );
+  }
+}
+
+function formatCheckoutAmount(amount: number, currency: string): string {
+  const safeAmount = Number.isFinite(Number(amount)) ? Number(amount) : 0;
+  if (String(currency).toUpperCase() === "INR") {
+    return `₹${safeAmount.toFixed(2)}`;
+  }
+  return `${String(currency || "INR").toUpperCase()} ${safeAmount.toFixed(2)}`;
+}
+
 async function sendText(env: Bindings, to: string, body: string): Promise<void> {
   const graphVersion = env.META_GRAPH_VERSION?.trim() || "v25.0";
   const endpoint = `https://graph.facebook.com/${graphVersion}/${env.WHATSAPP_PHONE_NUMBER_ID}/messages`;
@@ -536,6 +1118,41 @@ async function sendText(env: Bindings, to: string, body: string): Promise<void> 
 
   if (!response.ok) {
     throw new Error(`WhatsApp API request failed with status ${response.status}`);
+  }
+}
+
+async function sendImage(
+  env: Bindings,
+  to: string,
+  imageUrl: string,
+  caption: string,
+): Promise<void> {
+  const graphVersion = env.META_GRAPH_VERSION?.trim() || "v25.0";
+  const endpoint = `https://graph.facebook.com/${graphVersion}/${env.WHATSAPP_PHONE_NUMBER_ID}/messages`;
+
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${env.WHATSAPP_ACCESS_TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      messaging_product: "whatsapp",
+      recipient_type: "individual",
+      to,
+      type: "image",
+      image: {
+        link: imageUrl,
+        caption: caption.slice(0, 1024),
+      },
+    }),
+  });
+
+  const responseBody = await response.text();
+  console.log(`WhatsApp image status: ${response.status}`, responseBody);
+
+  if (!response.ok) {
+    throw new Error(`WhatsApp image request failed with status ${response.status}`);
   }
 }
 
@@ -569,6 +1186,44 @@ async function initializeDatabase(env: Bindings): Promise<void> {
         whatsapp_message_id TEXT,
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
       )
+    `),
+    env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS processed_shopify_webhooks (
+        webhook_id TEXT PRIMARY KEY,
+        processed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )
+    `),
+    env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS recovered_checkout_tokens (
+        checkout_token TEXT PRIMARY KEY,
+        recovered_at INTEGER NOT NULL
+      )
+    `),
+    env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS abandoned_checkouts (
+        checkout_token TEXT PRIMARY KEY,
+        phone TEXT NOT NULL DEFAULT '',
+        customer_name TEXT NOT NULL DEFAULT 'there',
+        product_title TEXT NOT NULL DEFAULT 'your selected product',
+        product_image TEXT,
+        total_price REAL NOT NULL DEFAULT 0,
+        currency TEXT NOT NULL DEFAULT 'INR',
+        recovery_url TEXT NOT NULL DEFAULT '',
+        consent INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'pending',
+        skip_reason TEXT,
+        due_at INTEGER NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        sent_at INTEGER,
+        recovered_at INTEGER
+      )
+    `),
+    env.DB.prepare(`
+      CREATE INDEX IF NOT EXISTS idx_abandoned_due
+      ON abandoned_checkouts(status, due_at)
     `),
   ]);
 }
@@ -658,4 +1313,13 @@ async function saveConversation(
   }
 }
 
-export default app;
+export default {
+  fetch: app.fetch,
+  scheduled(
+    _controller: ScheduledController,
+    env: Bindings,
+    ctx: ExecutionContext,
+  ): void {
+    ctx.waitUntil(processDueAbandonedCheckouts(env));
+  },
+} satisfies ExportedHandler<Bindings>;
