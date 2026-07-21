@@ -23,9 +23,20 @@ type BotUser = {
   isNew: boolean;
 };
 
+type ProductVariantInfo = {
+  id: string | number;
+  title: string;
+  price: number | null;
+  available: boolean;
+  option1?: string;
+  option2?: string;
+  option3?: string;
+};
+
 type ProductSuggestion = {
   title: string;
   url: string;
+  handle?: string;
   price?: string | number;
   price_min?: string | number;
   available?: boolean;
@@ -39,6 +50,39 @@ type ProductSuggestion = {
   product_type?: string;
   tags?: string[] | string;
   catalogue_id?: string;
+  variants?: ProductVariantInfo[];
+};
+
+type OrderFlowContext = {
+  phone: string;
+  step: string;
+  selected_product: ProductSuggestion | null;
+  selected_variant: ProductVariantInfo | null;
+  customization_text: string;
+  quantity: number;
+  customer_name: string;
+  full_address: string;
+  pincode: string;
+};
+
+type ShopifyOrderRow = {
+  order_id: string;
+  order_number: string;
+  order_name: string;
+  phone: string;
+  customer_name: string;
+  financial_status: string;
+  fulfillment_status: string;
+  shipment_status: string;
+  status_label: string;
+  tracking_company: string;
+  tracking_number: string;
+  tracking_url: string;
+  order_status_url: string;
+  total_price: number;
+  currency: string;
+  line_items_summary: string;
+  cancelled_at: string;
 };
 
 type RecommendationContext = {
@@ -215,6 +259,20 @@ app.get("/shopify/health", async (c) => {
   });
 });
 
+app.get("/shopify/order-health", async (c) => {
+  await initializeDatabase(c.env);
+  const counts = await c.env.DB.prepare(`
+    SELECT
+      COUNT(*) AS total,
+      COALESCE(SUM(CASE WHEN financial_status = 'paid' THEN 1 ELSE 0 END), 0) AS paid,
+      COALESCE(SUM(CASE WHEN tracking_number != '' OR tracking_url != '' THEN 1 ELSE 0 END), 0) AS shipped,
+      COALESCE(SUM(CASE WHEN shipment_status = 'delivered' THEN 1 ELSE 0 END), 0) AS delivered
+    FROM shopify_orders
+  `).first();
+
+  return c.json({ ok: true, automation: "orders-and-tracking", counts: counts ?? {} });
+});
+
 app.post("/shopify/run-abandoned", async (c) => {
   if (!isAuthorizedShopifyWebhook(c.env, c.req.query("token"))) {
     return c.text("Forbidden", 403);
@@ -264,7 +322,19 @@ app.get("/admin/api/chats", async (c) => {
       c.body AS last_message,
       c.direction AS last_direction,
       c.created_at AS last_at,
-      COALESCE((
+      COALESCE(NULLIF((
+        SELECT o.status_label
+        FROM shopify_orders o
+        WHERE substr(o.phone, -10) = substr(c.phone, -10)
+        ORDER BY o.updated_at DESC
+        LIMIT 1
+      ), ''), NULLIF((
+        SELECT d.status
+        FROM whatsapp_order_drafts d
+        WHERE substr(d.phone, -10) = substr(c.phone, -10)
+        ORDER BY d.updated_at DESC
+        LIMIT 1
+      ), ''), (
         SELECT a.status
         FROM abandoned_checkouts a
         WHERE a.phone = c.phone
@@ -479,8 +549,11 @@ async function processMessage(env: Bindings, message: any): Promise<void> {
     return;
   }
 
-  if (isOrderCommand(normalized) || normalized === "8") {
-    await replyAndLog(env, from, orderStatusMessage(user.language));
+  if (await handleTrackingFlow(env, from, user.language, text, normalized)) {
+    return;
+  }
+
+  if (await handleWhatsAppOrderFlow(env, from, user.language, text, normalized)) {
     return;
   }
 
@@ -642,6 +715,33 @@ function isOrderCommand(value: string): boolean {
   );
 }
 
+function isBuyIntent(value: string): boolean {
+  return [
+    "order karna", "order place", "buy now", "book kar", "ye wala chahiye",
+    "final kar", "purchase", "customise now", "customize now", "confirm order",
+    "ऑर्डर करना", "ऑर्डर कर दो", "बुक कर दो", "खरीदना",
+  ].some((term) => value.includes(term));
+}
+
+function isConfirmOrderIntent(value: string): boolean {
+  return ["confirm", "confirm order", "yes confirm", "place order", "payment link", "pay now", "haan confirm", "हाँ कन्फर्म"].some(
+    (term) => value === term || value.includes(term),
+  );
+}
+
+function isCancelOrderIntent(value: string): boolean {
+  return ["cancel", "cancel order", "stop", "nahi chahiye", "नहीं चाहिए", "रद्द"].some(
+    (term) => value.includes(term),
+  );
+}
+
+function parseProductOptionNumber(value: string): number | null {
+  const exact = /^([1-3])$/.exec(value);
+  if (exact) return Number(exact[1]);
+  const match = /(?:option|product|design|विकल्प)\s*([1-3])/i.exec(value);
+  return match ? Number(match[1]) : null;
+}
+
 function isBudgetCommand(value: string): boolean {
   return ["budget", "under", "below", "tak", "तक", "cheap gift", "gift under"].some((term) =>
     value.includes(term),
@@ -756,20 +856,88 @@ async function attachCatalogueIds(
   const enriched: ProductSuggestion[] = [];
 
   for (const product of products) {
+    let detailed: ProductSuggestion = { ...product };
+
     try {
-      const productUrl = absoluteUrl(shopDomain(env), product.url);
+      detailed = await fetchVerifiedProductDetails(env, product);
+    } catch (error) {
+      console.error("Product detail enrichment failed:", product.url, error);
+    }
+
+    try {
+      const productUrl = absoluteUrl(shopDomain(env), detailed.url);
       const row = await env.DB.prepare(
         "SELECT catalogue_id FROM product_catalogue_map WHERE product_url = ? LIMIT 1",
       )
         .bind(productUrl)
         .first<{ catalogue_id: string }>();
-      enriched.push({ ...product, catalogue_id: row?.catalogue_id || undefined });
+      enriched.push({ ...detailed, catalogue_id: row?.catalogue_id || undefined });
     } catch {
-      enriched.push(product);
+      enriched.push(detailed);
     }
   }
 
   return enriched;
+}
+
+async function fetchVerifiedProductDetails(
+  env: Bindings,
+  product: ProductSuggestion,
+): Promise<ProductSuggestion> {
+  const productUrl = new URL(absoluteUrl(shopDomain(env), product.url));
+  productUrl.pathname = `${productUrl.pathname.replace(/\/$/, "").replace(/\.js$/i, "")}.js`;
+  productUrl.search = "";
+
+  const response = await fetch(productUrl.toString(), {
+    headers: { Accept: "application/json" },
+  });
+  if (!response.ok) return product;
+
+  const data: any = await response.json();
+  const variants: ProductVariantInfo[] = Array.isArray(data?.variants)
+    ? data.variants
+        .map((variant: any) => ({
+          id: variant?.id,
+          title: String(variant?.title ?? "Default Title"),
+          price: ajaxMoneyToRupees(variant?.price),
+          available: variant?.available !== false,
+          option1: variant?.option1 ? String(variant.option1) : undefined,
+          option2: variant?.option2 ? String(variant.option2) : undefined,
+          option3: variant?.option3 ? String(variant.option3) : undefined,
+        }))
+        .filter((variant: ProductVariantInfo) => Boolean(variant.id))
+    : [];
+
+  const featuredImage = normalizePublicImageUrl(
+    typeof data?.featured_image === "string"
+      ? data.featured_image
+      : data?.featured_image?.src ?? data?.featured_image?.url,
+  );
+
+  return {
+    ...product,
+    title: String(data?.title ?? product.title),
+    handle: String(data?.handle ?? product.handle ?? ""),
+    available: data?.available !== false,
+    price: ajaxMoneyToRupees(data?.price) ?? product.price,
+    price_min: ajaxMoneyToRupees(data?.price_min) ?? product.price_min,
+    featured_image: featuredImage || product.featured_image,
+    description: typeof data?.description === "string" ? data.description : product.description,
+    variants,
+  };
+}
+
+function ajaxMoneyToRupees(value: unknown): number | null {
+  const amount = Number(value);
+  if (!Number.isFinite(amount)) return null;
+  return amount / 100;
+}
+
+function normalizePublicImageUrl(value: unknown): string | null {
+  const raw = String(value ?? "").trim();
+  if (!raw) return null;
+  if (raw.startsWith("//")) return `https:${raw}`;
+  return /^https:\/\//i.test(raw) ? raw : null;
 }
 
 function rankAndFilterProducts(
@@ -849,6 +1017,7 @@ async function sendProductCards(
   products: ProductSuggestion[],
 ): Promise<void> {
   const safeProducts = products.slice(0, 3);
+  await saveLastProductSuggestions(env, phone, safeProducts);
 
   for (let index = 0; index < safeProducts.length; index += 1) {
     const product = safeProducts[index];
@@ -935,8 +1104,7 @@ function productImageUrl(product: ProductSuggestion): string | null {
       ? featured
       : featured?.url ?? product.image;
 
-  if (!url || !/^https:\/\//i.test(url)) return null;
-  return url;
+  return normalizePublicImageUrl(url);
 }
 
 function productCardsFooter(
@@ -1103,14 +1271,14 @@ function supportMessage(language: Language): string {
 
 function orderStatusMessage(language: Language): string {
   if (language === "en") {
-    return "Please send your *order number* and *registered mobile number*. Our support team will check and share the latest status.";
+    return "Please send your *order number* (example: #1234). I will check it using this WhatsApp number.";
   }
 
   if (language === "hi") {
-    return "कृपया अपना *ऑर्डर नंबर* और *रजिस्टर्ड मोबाइल नंबर* भेजें। हमारी सपोर्ट टीम नवीनतम स्टेटस बताएगी।";
+    return "कृपया अपना *ऑर्डर नंबर* भेजें, जैसे #1234। इसी WhatsApp नंबर से स्टेटस चेक किया जाएगा।";
   }
 
-  return "Please send your *order number* and *registered mobile number*.\nकृपया अपना *ऑर्डर नंबर* और *रजिस्टर्ड मोबाइल नंबर* भेजें।";
+  return "Apna *order number* bhejein, jaise #1234. Isi WhatsApp number se status check hoga.";
 }
 
 function budgetMessage(language: Language, domain: string): string {
@@ -1196,7 +1364,15 @@ async function processShopifyWebhook(
       topic === "orders/paid" ||
       topic === "orders/updated"
     ) {
+      await upsertShopifyOrder(env, payload);
       await markCheckoutRecovered(env, String(payload?.checkout_token ?? ""));
+      await notifyOrderUpdateInsideCustomerWindow(env, topic, payload);
+      return;
+    }
+
+    if (topic === "fulfillments/create" || topic === "fulfillments/update") {
+      await updateShopifyOrderFromFulfillment(env, payload);
+      await notifyFulfillmentUpdateInsideCustomerWindow(env, payload);
       return;
     }
 
@@ -1773,10 +1949,913 @@ async function initializeDatabase(env: Bindings): Promise<void> {
       )
     `),
     env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS last_product_suggestions (
+        phone TEXT PRIMARY KEY,
+        products_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )
+    `),
+    env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS order_flow_context (
+        phone TEXT PRIMARY KEY,
+        step TEXT NOT NULL,
+        selected_product_json TEXT,
+        selected_variant_json TEXT,
+        customization_text TEXT NOT NULL DEFAULT '',
+        quantity INTEGER NOT NULL DEFAULT 1,
+        customer_name TEXT NOT NULL DEFAULT '',
+        full_address TEXT NOT NULL DEFAULT '',
+        pincode TEXT NOT NULL DEFAULT '',
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )
+    `),
+    env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS order_tracking_context (
+        phone TEXT PRIMARY KEY,
+        pending INTEGER NOT NULL DEFAULT 1,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )
+    `),
+    env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS whatsapp_order_drafts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        phone TEXT NOT NULL,
+        customer_name TEXT NOT NULL DEFAULT '',
+        product_title TEXT NOT NULL,
+        product_url TEXT NOT NULL DEFAULT '',
+        variant_id TEXT NOT NULL,
+        variant_title TEXT NOT NULL DEFAULT '',
+        customization_text TEXT NOT NULL DEFAULT '',
+        quantity INTEGER NOT NULL DEFAULT 1,
+        unit_price REAL,
+        total_price REAL,
+        full_address TEXT NOT NULL DEFAULT '',
+        pincode TEXT NOT NULL DEFAULT '',
+        checkout_url TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'payment_pending',
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )
+    `),
+    env.DB.prepare(`
+      CREATE INDEX IF NOT EXISTS idx_whatsapp_order_drafts_phone
+      ON whatsapp_order_drafts(phone, updated_at)
+    `),
+    env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS shopify_orders (
+        order_id TEXT PRIMARY KEY,
+        order_number TEXT NOT NULL DEFAULT '',
+        order_name TEXT NOT NULL DEFAULT '',
+        phone TEXT NOT NULL DEFAULT '',
+        customer_name TEXT NOT NULL DEFAULT '',
+        financial_status TEXT NOT NULL DEFAULT '',
+        fulfillment_status TEXT NOT NULL DEFAULT '',
+        shipment_status TEXT NOT NULL DEFAULT '',
+        status_label TEXT NOT NULL DEFAULT 'Order confirmed',
+        tracking_company TEXT NOT NULL DEFAULT '',
+        tracking_number TEXT NOT NULL DEFAULT '',
+        tracking_url TEXT NOT NULL DEFAULT '',
+        order_status_url TEXT NOT NULL DEFAULT '',
+        total_price REAL NOT NULL DEFAULT 0,
+        currency TEXT NOT NULL DEFAULT 'INR',
+        line_items_summary TEXT NOT NULL DEFAULT '',
+        cancelled_at TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )
+    `),
+    env.DB.prepare(`
+      CREATE INDEX IF NOT EXISTS idx_shopify_orders_lookup
+      ON shopify_orders(order_number, phone, updated_at)
+    `),
+    env.DB.prepare(`
       CREATE INDEX IF NOT EXISTS idx_abandoned_due
       ON abandoned_checkouts(status, due_at)
     `),
   ]);
+}
+
+async function saveLastProductSuggestions(
+  env: Bindings,
+  phone: string,
+  products: ProductSuggestion[],
+): Promise<void> {
+  await env.DB.prepare(`
+    INSERT INTO last_product_suggestions (phone, products_json, updated_at)
+    VALUES (?, ?, CURRENT_TIMESTAMP)
+    ON CONFLICT(phone) DO UPDATE SET
+      products_json = excluded.products_json,
+      updated_at = CURRENT_TIMESTAMP
+  `)
+    .bind(phone, JSON.stringify(products.slice(0, 3)))
+    .run();
+}
+
+async function getLastProductSuggestions(
+  env: Bindings,
+  phone: string,
+): Promise<ProductSuggestion[]> {
+  const row = await env.DB.prepare(`
+    SELECT products_json, updated_at
+    FROM last_product_suggestions
+    WHERE phone = ?
+      AND datetime(updated_at) >= datetime('now', '-24 hours')
+    LIMIT 1
+  `)
+    .bind(phone)
+    .first<{ products_json: string }>();
+
+  if (!row?.products_json) return [];
+  try {
+    const products = JSON.parse(row.products_json);
+    return Array.isArray(products) ? products.slice(0, 3) : [];
+  } catch {
+    return [];
+  }
+}
+
+async function handleTrackingFlow(
+  env: Bindings,
+  phone: string,
+  language: Language,
+  text: string,
+  normalized: string,
+): Promise<boolean> {
+  const pending = await env.DB.prepare(
+    "SELECT pending FROM order_tracking_context WHERE phone = ? LIMIT 1",
+  )
+    .bind(phone)
+    .first<{ pending: number }>();
+
+  if (!isOrderCommand(normalized) && normalized !== "8" && !pending?.pending) {
+    return false;
+  }
+
+  const orderNumber = extractOrderNumber(text);
+  if (!orderNumber) {
+    await env.DB.prepare(`
+      INSERT INTO order_tracking_context (phone, pending, updated_at)
+      VALUES (?, 1, CURRENT_TIMESTAMP)
+      ON CONFLICT(phone) DO UPDATE SET pending = 1, updated_at = CURRENT_TIMESTAMP
+    `)
+      .bind(phone)
+      .run();
+    await replyAndLog(env, phone, orderStatusMessage(language));
+    return true;
+  }
+
+  const order = await findShopifyOrder(env, phone, orderNumber);
+  await env.DB.prepare("DELETE FROM order_tracking_context WHERE phone = ?")
+    .bind(phone)
+    .run();
+
+  if (!order) {
+    await replyAndLog(env, phone, orderNotFoundMessage(language, orderNumber));
+    return true;
+  }
+
+  await replyAndLog(env, phone, formatOrderStatusMessage(language, order));
+  return true;
+}
+
+function extractOrderNumber(value: string): string | null {
+  const explicit = /(?:order|ऑर्डर)?\s*(?:number|no\.?|#)?\s*#?([0-9]{3,10})/i.exec(value);
+  if (explicit) return explicit[1];
+  const exact = /^\s*#?([0-9]{3,10})\s*$/.exec(value);
+  return exact ? exact[1] : null;
+}
+
+async function findShopifyOrder(
+  env: Bindings,
+  phone: string,
+  orderNumber: string,
+): Promise<ShopifyOrderRow | null> {
+  const digits = orderNumber.replace(/\D/g, "");
+  const row = await env.DB.prepare(`
+    SELECT order_id, order_number, order_name, phone, customer_name,
+           financial_status, fulfillment_status, shipment_status, status_label,
+           tracking_company, tracking_number, tracking_url, order_status_url,
+           total_price, currency, line_items_summary, cancelled_at
+    FROM shopify_orders
+    WHERE (order_number = ? OR REPLACE(REPLACE(order_name, '#', ''), 'IG', '') = ?)
+      AND substr(phone, -10) = substr(?, -10)
+    ORDER BY updated_at DESC
+    LIMIT 1
+  `)
+    .bind(digits, digits, phone)
+    .first<ShopifyOrderRow>();
+  return row ?? null;
+}
+
+function orderNotFoundMessage(language: Language, orderNumber: string): string {
+  if (language === "hi") {
+    return `ऑर्डर #${orderNumber} इस WhatsApp नंबर से नहीं मिला। नंबर दोबारा check करें या *Support* लिखें।`;
+  }
+  if (language === "en") {
+    return `Order #${orderNumber} was not found for this WhatsApp number. Check the number or reply *Support*.`;
+  }
+  return `Order #${orderNumber} is WhatsApp number se nahi mila. Number check karein ya *Support* likhein.`;
+}
+
+function formatOrderStatusMessage(language: Language, order: ShopifyOrderRow): string {
+  const orderName = order.order_name || `#${order.order_number}`;
+  const total = formatCheckoutAmount(Number(order.total_price || 0), order.currency || "INR");
+  const tracking = order.tracking_number
+    ? `\nTracking Number: ${order.tracking_number}`
+    : "";
+  const courier = order.tracking_company
+    ? `\nCourier: ${order.tracking_company}`
+    : "";
+  const trackingUrl = order.tracking_url
+    ? `\n🚚 Track shipment: ${order.tracking_url}`
+    : "";
+  const statusUrl = order.order_status_url
+    ? `\n📦 Shopify order page: ${order.order_status_url}`
+    : "";
+
+  if (language === "hi") {
+    return `📦 *ऑर्डर स्टेटस*\n\nऑर्डर: ${orderName}\nप्रोडक्ट: ${order.line_items_summary || "Order items"}\nकुल: ${total}\nपेमेंट: ${humanizeStatus(order.financial_status || "pending")}\nस्टेटस: *${order.status_label}*${courier}${tracking}${trackingUrl}${statusUrl}`;
+  }
+
+  if (language === "en") {
+    return `📦 *Order Status*\n\nOrder: ${orderName}\nProduct: ${order.line_items_summary || "Order items"}\nTotal: ${total}\nPayment: ${humanizeStatus(order.financial_status || "pending")}\nStatus: *${order.status_label}*${courier}${tracking}${trackingUrl}${statusUrl}`;
+  }
+
+  return `📦 *Order Status / ऑर्डर स्टेटस*\n\nOrder: ${orderName}\nProduct: ${order.line_items_summary || "Order items"}\nTotal: ${total}\nPayment: ${humanizeStatus(order.financial_status || "pending")}\nStatus: *${order.status_label}*${courier}${tracking}${trackingUrl}${statusUrl}`;
+}
+
+async function handleWhatsAppOrderFlow(
+  env: Bindings,
+  phone: string,
+  language: Language,
+  text: string,
+  normalized: string,
+): Promise<boolean> {
+  let context = await getOrderFlowContext(env, phone);
+  const suggestions = await getLastProductSuggestions(env, phone);
+  const optionNumber = parseProductOptionNumber(normalized);
+  const optionSelection = optionNumber !== null && suggestions.length >= optionNumber;
+
+  if (!context && !isBuyIntent(normalized) && !optionSelection) return false;
+
+  if (isCancelOrderIntent(normalized)) {
+    await clearOrderFlowContext(env, phone);
+    await replyAndLog(env, phone, orderCancelledMessage(language));
+    return true;
+  }
+
+  if (!context) {
+    if (suggestions.length === 0) {
+      await replyAndLog(env, phone, noSelectedProductForOrderMessage(language));
+      return true;
+    }
+
+    let selectedIndex = optionNumber ? optionNumber - 1 : suggestions.length === 1 ? 0 : -1;
+    if (selectedIndex < 0 || !suggestions[selectedIndex]) {
+      await replyAndLog(env, phone, askProductOptionForOrderMessage(language, suggestions.length));
+      return true;
+    }
+
+    let product = suggestions[selectedIndex];
+    if (!product.variants?.length) {
+      product = await fetchVerifiedProductDetails(env, product);
+    }
+
+    const variants = (product.variants ?? []).filter((variant) => variant.available);
+    if (variants.length === 0) {
+      await replyAndLog(env, phone, productUnavailableForOrderMessage(language));
+      return true;
+    }
+
+    const meaningfulVariants = variants.filter(
+      (variant) => normalize(variant.title) !== "default title",
+    );
+    const firstVariant = meaningfulVariants.length === 0 ? variants[0] : null;
+
+    context = {
+      phone,
+      step: firstVariant ? (isCustomProduct(product) ? "customization" : "quantity") : "variant",
+      selected_product: product,
+      selected_variant: firstVariant,
+      customization_text: "",
+      quantity: 1,
+      customer_name: "",
+      full_address: "",
+      pincode: "",
+    };
+    await saveOrderFlowContext(env, context);
+
+    if (!firstVariant) {
+      await replyAndLog(env, phone, variantSelectionMessage(language, product, meaningfulVariants));
+    } else if (isCustomProduct(product)) {
+      await replyAndLog(env, phone, customizationQuestionMessage(language, product.title));
+    } else {
+      await replyAndLog(env, phone, quantityQuestionMessage(language));
+    }
+    return true;
+  }
+
+  if (context.step === "variant") {
+    const variants = (context.selected_product?.variants ?? []).filter(
+      (variant) => variant.available && normalize(variant.title) !== "default title",
+    );
+    const selected = selectVariantFromReply(variants, text);
+    if (!selected) {
+      await replyAndLog(env, phone, variantSelectionMessage(language, context.selected_product!, variants));
+      return true;
+    }
+    context.selected_variant = selected;
+    context.step = context.selected_product && isCustomProduct(context.selected_product)
+      ? "customization"
+      : "quantity";
+    await saveOrderFlowContext(env, context);
+    await replyAndLog(
+      env,
+      phone,
+      context.step === "customization"
+        ? customizationQuestionMessage(language, context.selected_product?.title || "product")
+        : quantityQuestionMessage(language),
+    );
+    return true;
+  }
+
+  if (context.step === "customization") {
+    const value = text.trim();
+    if (!value || value.length > 150) {
+      await replyAndLog(env, phone, customizationQuestionMessage(language, context.selected_product?.title || "product"));
+      return true;
+    }
+    context.customization_text = /^(na|n\/a|no|none|नहीं)$/i.test(value) ? "" : value;
+    context.step = "quantity";
+    await saveOrderFlowContext(env, context);
+    await replyAndLog(env, phone, quantityQuestionMessage(language));
+    return true;
+  }
+
+  if (context.step === "quantity") {
+    const quantity = parseQuantity(text);
+    if (!quantity) {
+      await replyAndLog(env, phone, quantityQuestionMessage(language));
+      return true;
+    }
+    context.quantity = quantity;
+    context.step = "customer_name";
+    await saveOrderFlowContext(env, context);
+    await replyAndLog(env, phone, customerNameQuestionMessage(language));
+    return true;
+  }
+
+  if (context.step === "customer_name") {
+    const value = text.trim().replace(/\s+/g, " ");
+    if (value.length < 2 || value.length > 80) {
+      await replyAndLog(env, phone, customerNameQuestionMessage(language));
+      return true;
+    }
+    context.customer_name = value;
+    context.step = "address";
+    await saveOrderFlowContext(env, context);
+    await replyAndLog(env, phone, addressQuestionMessage(language));
+    return true;
+  }
+
+  if (context.step === "address") {
+    const value = text.trim().replace(/\s+/g, " ");
+    if (value.length < 12 || value.length > 300) {
+      await replyAndLog(env, phone, addressQuestionMessage(language));
+      return true;
+    }
+    context.full_address = value;
+    context.step = "pincode";
+    await saveOrderFlowContext(env, context);
+    await replyAndLog(env, phone, pincodeQuestionMessage(language));
+    return true;
+  }
+
+  if (context.step === "pincode") {
+    const pincode = extractIndianPincode(text);
+    if (!pincode) {
+      await replyAndLog(env, phone, pincodeQuestionMessage(language));
+      return true;
+    }
+    context.pincode = pincode;
+    context.step = "confirm";
+    await saveOrderFlowContext(env, context);
+    await replyAndLog(env, phone, orderSummaryMessage(language, context));
+    return true;
+  }
+
+  if (context.step === "confirm") {
+    if (!isConfirmOrderIntent(normalized)) {
+      await replyAndLog(env, phone, confirmOrderAgainMessage(language));
+      return true;
+    }
+
+    try {
+      const checkoutUrl = buildShopifyCheckoutUrl(env, context, phone);
+      await saveWhatsAppOrderDraft(env, context, checkoutUrl, phone);
+      await replyAndLog(env, phone, paymentLinkMessage(language, checkoutUrl));
+      await clearOrderFlowContext(env, phone);
+    } catch (error) {
+      console.error("Checkout link creation failed:", error);
+      await replyAndLog(env, phone, checkoutLinkFailureMessage(language));
+    }
+    return true;
+  }
+
+  return true;
+}
+
+function selectVariantFromReply(
+  variants: ProductVariantInfo[],
+  value: string,
+): ProductVariantInfo | null {
+  const normalizedValue = normalize(value);
+  const number = /^(?:option\s*)?([1-9])$/.exec(normalizedValue);
+  if (number) return variants[Number(number[1]) - 1] ?? null;
+
+  const direct = variants.find((variant) => normalize(variant.title) === normalizedValue);
+  if (direct) return direct;
+
+  return variants.find((variant) => normalize(variant.title).includes(normalizedValue)) ?? null;
+}
+
+function parseQuantity(value: string): number | null {
+  const match = /(?:qty|quantity)?\s*([1-9]|10)\b/i.exec(value.trim());
+  if (!match) return null;
+  const quantity = Number(match[1]);
+  return quantity >= 1 && quantity <= 10 ? quantity : null;
+}
+
+function extractIndianPincode(value: string): string | null {
+  const match = /\b([1-9][0-9]{5})\b/.exec(value);
+  return match ? match[1] : null;
+}
+
+function variantSelectionMessage(
+  language: Language,
+  product: ProductSuggestion,
+  variants: ProductVariantInfo[],
+): string {
+  const options = variants.slice(0, 9).map((variant, index) => {
+    const price = variant.price === null ? "" : ` — ${formatPrice(variant.price)}`;
+    return `${index + 1}. ${variant.title}${price}`;
+  }).join("\n");
+  if (language === "hi") return `*${product.title}* के लिए option चुनें:\n${options}\n\nसिर्फ option number भेजें।`;
+  if (language === "en") return `Choose an option for *${product.title}*:\n${options}\n\nReply with the option number.`;
+  return `*${product.title}* ke liye option select karein:\n${options}\n\nSirf option number bhejein.`;
+}
+
+function customizationQuestionMessage(language: Language, title: string): string {
+  if (language === "hi") return `*${title}* पर कौन-सा नाम/टेक्स्ट चाहिए? Customization नहीं चाहिए तो *NA* लिखें।`;
+  if (language === "en") return `What name/text should be customised on *${title}*? Reply *NA* if not required.`;
+  return `*${title}* par kaunsa name/text customise karna hai? Nahi chahiye to *NA* likhein.`;
+}
+
+function quantityQuestionMessage(language: Language): string {
+  if (language === "hi") return "Quantity कितनी चाहिए? 1 से 10 के बीच number भेजें।";
+  if (language === "en") return "What quantity do you need? Send a number from 1 to 10.";
+  return "Quantity kitni chahiye? 1 se 10 ke beech number bhejein.";
+}
+
+function customerNameQuestionMessage(language: Language): string {
+  if (language === "hi") return "Delivery के लिए पूरा नाम भेजें।";
+  if (language === "en") return "Please send the full name for delivery.";
+  return "Delivery ke liye customer ka full name bhejein.";
+}
+
+function addressQuestionMessage(language: Language): string {
+  if (language === "hi") return "पूरा delivery address भेजें: House/Street, Area, City और State।";
+  if (language === "en") return "Send the complete delivery address: house/street, area, city and state.";
+  return "Pura delivery address bhejein: House/Street, Area, City aur State.";
+}
+
+function pincodeQuestionMessage(language: Language): string {
+  if (language === "hi") return "6 अंकों का delivery PIN code भेजें।";
+  if (language === "en") return "Please send the 6-digit delivery PIN code.";
+  return "6 digit delivery PIN code bhejein.";
+}
+
+function askProductOptionForOrderMessage(language: Language, count: number): string {
+  const options = Array.from({ length: count }, (_, i) => i + 1).join(", ");
+  if (language === "hi") return `कौन-सा product order करना है? Option ${options} में से number भेजें।`;
+  if (language === "en") return `Which product would you like to order? Reply with option ${options}.`;
+  return `Kaunsa product order karna hai? Option ${options} mein se number bhejein.`;
+}
+
+function noSelectedProductForOrderMessage(language: Language): string {
+  if (language === "hi") return "पहले product का नाम भेजें। Product दिखने के बाद *Option 1 order* जैसा reply करें।";
+  if (language === "en") return "Please send the product name first. After products appear, reply like *Order option 1*.";
+  return "Pehle product ka naam bhejein. Products dikhne ke baad *Option 1 order* likhein.";
+}
+
+function productUnavailableForOrderMessage(language: Language): string {
+  if (language === "hi") return "यह product/variant अभी verified availability में नहीं है। दूसरा option चुनें।";
+  if (language === "en") return "This product/variant is not currently available. Please choose another option.";
+  return "Ye product/variant abhi available nahi hai. Dusra option choose karein.";
+}
+
+function orderCancelledMessage(language: Language): string {
+  if (language === "hi") return "Order process cancel कर दिया गया है ✅";
+  if (language === "en") return "The order process has been cancelled ✅";
+  return "Order process cancel kar diya gaya hai ✅";
+}
+
+function orderSummaryMessage(language: Language, context: OrderFlowContext): string {
+  const variantPrice = context.selected_variant?.price;
+  const total = variantPrice === null || variantPrice === undefined
+    ? "Checkout पर confirm होगा"
+    : formatPrice(variantPrice * context.quantity) || "Checkout पर confirm होगा";
+  const customization = context.customization_text
+    ? `\nCustomization: ${context.customization_text}`
+    : "";
+  const variant = context.selected_variant?.title && normalize(context.selected_variant.title) !== "default title"
+    ? `\nOption: ${context.selected_variant.title}`
+    : "";
+
+  return `✅ *Order Summary*\n\nProduct: ${context.selected_product?.title || "Product"}${variant}${customization}\nQuantity: ${context.quantity}\nTotal: ${total}\n\nDelivery Name: ${context.customer_name}\nAddress: ${context.full_address}\nPIN: ${context.pincode}\n\nCustom products ke liye COD available nahi hai. Final price aur shipping checkout par verify karein.\n\nOrder sahi hai to *Confirm Order* likhein. Cancel ke liye *Cancel Order* likhein.`;
+}
+
+function confirmOrderAgainMessage(language: Language): string {
+  if (language === "hi") return "Payment link बनाने के लिए *Confirm Order* लिखें या रोकने के लिए *Cancel Order* लिखें।";
+  if (language === "en") return "Reply *Confirm Order* to create the payment link, or *Cancel Order* to stop.";
+  return "Payment link ke liye *Confirm Order* likhein, ya rokne ke liye *Cancel Order*.";
+}
+
+function paymentLinkMessage(language: Language, checkoutUrl: string): string {
+  if (language === "hi") {
+    return `आपका order checkout ready है ✅\n\n🔐 Secure payment link:\n${checkoutUrl}\n\nCustom products पर COD उपलब्ध नहीं है। OTP, UPI PIN, CVV या card details WhatsApp पर कभी share न करें। Payment के बाद Shopify order number मिलेगा।`;
+  }
+  if (language === "en") {
+    return `Your checkout is ready ✅\n\n🔐 Secure payment link:\n${checkoutUrl}\n\nCOD is unavailable for customised products. Never share OTP, UPI PIN, CVV or card details on WhatsApp. Shopify will provide the order number after payment.`;
+  }
+  return `Aapka checkout ready hai ✅\n\n🔐 Secure payment link:\n${checkoutUrl}\n\nCustom products par COD available nahi hai. OTP, UPI PIN, CVV ya card details WhatsApp par share na karein. Payment ke baad Shopify order number milega.`;
+}
+
+function checkoutLinkFailureMessage(language: Language): string {
+  if (language === "hi") return "Verified checkout link नहीं बन पाया। कृपया *Support* लिखें; team order complete करेगी।";
+  if (language === "en") return "A verified checkout link could not be created. Reply *Support* for assistance.";
+  return "Verified checkout link create nahi ho paya. *Support* likhein; team help karegi.";
+}
+
+function buildShopifyCheckoutUrl(
+  env: Bindings,
+  context: OrderFlowContext,
+  phone: string,
+): string {
+  const variantId = String(context.selected_variant?.id ?? "").replace(/\D/g, "");
+  if (!variantId) throw new Error("Numeric Shopify variant ID is missing");
+
+  const quantity = Math.max(1, Math.min(10, Number(context.quantity || 1)));
+  const url = new URL(`/cart/${variantId}:${quantity}`, shopDomain(env));
+  const properties: Record<string, string> = {
+    "WhatsApp Phone": `+${phone}`,
+    "Order Source": "WhatsApp Bot",
+  };
+  if (context.customization_text) properties["Custom Text"] = context.customization_text;
+
+  url.searchParams.set("properties", base64UrlEncode(JSON.stringify(properties)));
+  url.searchParams.set("checkout[shipping_address][first_name]", context.customer_name);
+  url.searchParams.set("checkout[shipping_address][address1]", context.full_address);
+  url.searchParams.set("checkout[shipping_address][zip]", context.pincode);
+  url.searchParams.set("checkout[shipping_address][country]", "India");
+  url.searchParams.set("attributes[WhatsApp Phone]", `+${phone}`);
+  url.searchParams.set("attributes[Order Source]", "WhatsApp Bot");
+  url.searchParams.set("ref", "whatsapp-bot");
+  return url.toString();
+}
+
+function base64UrlEncode(value: string): string {
+  const bytes = new TextEncoder().encode(value);
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+async function getOrderFlowContext(
+  env: Bindings,
+  phone: string,
+): Promise<OrderFlowContext | null> {
+  const row = await env.DB.prepare(`
+    SELECT phone, step, selected_product_json, selected_variant_json,
+           customization_text, quantity, customer_name, full_address, pincode
+    FROM order_flow_context
+    WHERE phone = ?
+    LIMIT 1
+  `)
+    .bind(phone)
+    .first<any>();
+  if (!row) return null;
+
+  try {
+    return {
+      phone: row.phone,
+      step: row.step,
+      selected_product: row.selected_product_json ? JSON.parse(row.selected_product_json) : null,
+      selected_variant: row.selected_variant_json ? JSON.parse(row.selected_variant_json) : null,
+      customization_text: row.customization_text || "",
+      quantity: Number(row.quantity || 1),
+      customer_name: row.customer_name || "",
+      full_address: row.full_address || "",
+      pincode: row.pincode || "",
+    };
+  } catch {
+    await clearOrderFlowContext(env, phone);
+    return null;
+  }
+}
+
+async function saveOrderFlowContext(env: Bindings, context: OrderFlowContext): Promise<void> {
+  await env.DB.prepare(`
+    INSERT INTO order_flow_context (
+      phone, step, selected_product_json, selected_variant_json,
+      customization_text, quantity, customer_name, full_address, pincode, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+    ON CONFLICT(phone) DO UPDATE SET
+      step = excluded.step,
+      selected_product_json = excluded.selected_product_json,
+      selected_variant_json = excluded.selected_variant_json,
+      customization_text = excluded.customization_text,
+      quantity = excluded.quantity,
+      customer_name = excluded.customer_name,
+      full_address = excluded.full_address,
+      pincode = excluded.pincode,
+      updated_at = CURRENT_TIMESTAMP
+  `)
+    .bind(
+      context.phone,
+      context.step,
+      context.selected_product ? JSON.stringify(context.selected_product) : null,
+      context.selected_variant ? JSON.stringify(context.selected_variant) : null,
+      context.customization_text,
+      context.quantity,
+      context.customer_name,
+      context.full_address,
+      context.pincode,
+    )
+    .run();
+}
+
+async function clearOrderFlowContext(env: Bindings, phone: string): Promise<void> {
+  await env.DB.prepare("DELETE FROM order_flow_context WHERE phone = ?").bind(phone).run();
+}
+
+async function saveWhatsAppOrderDraft(
+  env: Bindings,
+  context: OrderFlowContext,
+  checkoutUrl: string,
+  phone: string,
+): Promise<void> {
+  const unitPrice = context.selected_variant?.price ?? null;
+  const totalPrice = unitPrice === null ? null : unitPrice * context.quantity;
+  await env.DB.prepare(`
+    INSERT INTO whatsapp_order_drafts (
+      phone, customer_name, product_title, product_url, variant_id, variant_title,
+      customization_text, quantity, unit_price, total_price, full_address, pincode,
+      checkout_url, status, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'payment_pending', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+  `)
+    .bind(
+      phone,
+      context.customer_name,
+      context.selected_product?.title || "Product",
+      context.selected_product ? absoluteUrl(shopDomain(env), context.selected_product.url) : "",
+      String(context.selected_variant?.id ?? ""),
+      context.selected_variant?.title || "",
+      context.customization_text,
+      context.quantity,
+      unitPrice,
+      totalPrice,
+      context.full_address,
+      context.pincode,
+      checkoutUrl,
+    )
+    .run();
+}
+
+async function upsertShopifyOrder(env: Bindings, payload: any): Promise<void> {
+  const orderId = String(payload?.id ?? payload?.admin_graphql_api_id ?? "").trim();
+  if (!orderId) return;
+
+  const phone = orderPhone(payload) ?? "";
+  const fulfillments = Array.isArray(payload?.fulfillments) ? payload.fulfillments : [];
+  const fulfillment = [...fulfillments].reverse().find((item: any) =>
+    item?.tracking_number || item?.tracking_url || item?.shipment_status,
+  ) ?? fulfillments[fulfillments.length - 1] ?? {};
+  const trackingNumber = String(
+    fulfillment?.tracking_number ?? fulfillment?.tracking_numbers?.[0] ?? "",
+  );
+  const trackingUrl = String(
+    fulfillment?.tracking_url ?? fulfillment?.tracking_urls?.[0] ?? "",
+  );
+  const shipmentStatus = String(fulfillment?.shipment_status ?? "");
+  const financialStatus = String(payload?.financial_status ?? "");
+  const fulfillmentStatus = String(payload?.fulfillment_status ?? "");
+  const cancelledAt = String(payload?.cancelled_at ?? "");
+  const statusLabel = deriveOrderStatusLabel({
+    financialStatus,
+    fulfillmentStatus,
+    shipmentStatus,
+    cancelledAt,
+    trackingNumber,
+    trackingUrl,
+  });
+  const orderNumber = String(payload?.order_number ?? "").replace(/\D/g, "");
+  const orderName = String(payload?.name ?? (orderNumber ? `#${orderNumber}` : ""));
+  const customerName = String(
+    payload?.shipping_address?.name ??
+    [payload?.customer?.first_name, payload?.customer?.last_name].filter(Boolean).join(" ") ??
+    "",
+  ).trim();
+  const lineItems = Array.isArray(payload?.line_items) ? payload.line_items : [];
+  const lineItemsSummary = lineItems.slice(0, 3).map((item: any) => {
+    const quantity = Number(item?.quantity ?? 1);
+    return `${String(item?.title ?? item?.name ?? "Product")}${quantity > 1 ? ` × ${quantity}` : ""}`;
+  }).join(", ");
+
+  await env.DB.prepare(`
+    INSERT INTO shopify_orders (
+      order_id, order_number, order_name, phone, customer_name, financial_status,
+      fulfillment_status, shipment_status, status_label, tracking_company,
+      tracking_number, tracking_url, order_status_url, total_price, currency,
+      line_items_summary, cancelled_at, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+    ON CONFLICT(order_id) DO UPDATE SET
+      order_number = excluded.order_number,
+      order_name = excluded.order_name,
+      phone = CASE WHEN excluded.phone != '' THEN excluded.phone ELSE shopify_orders.phone END,
+      customer_name = CASE WHEN excluded.customer_name != '' THEN excluded.customer_name ELSE shopify_orders.customer_name END,
+      financial_status = excluded.financial_status,
+      fulfillment_status = excluded.fulfillment_status,
+      shipment_status = excluded.shipment_status,
+      status_label = excluded.status_label,
+      tracking_company = excluded.tracking_company,
+      tracking_number = excluded.tracking_number,
+      tracking_url = excluded.tracking_url,
+      order_status_url = excluded.order_status_url,
+      total_price = excluded.total_price,
+      currency = excluded.currency,
+      line_items_summary = excluded.line_items_summary,
+      cancelled_at = excluded.cancelled_at,
+      updated_at = CURRENT_TIMESTAMP
+  `)
+    .bind(
+      orderId,
+      orderNumber,
+      orderName,
+      phone,
+      customerName,
+      financialStatus,
+      fulfillmentStatus,
+      shipmentStatus,
+      statusLabel,
+      String(fulfillment?.tracking_company ?? ""),
+      trackingNumber,
+      trackingUrl,
+      String(payload?.order_status_url ?? ""),
+      Number(payload?.current_total_price ?? payload?.total_price ?? 0),
+      String(payload?.currency ?? "INR"),
+      lineItemsSummary,
+      cancelledAt,
+    )
+    .run();
+
+  if (phone && financialStatus === "paid") {
+    await env.DB.prepare(`
+      UPDATE whatsapp_order_drafts
+      SET status = 'paid', updated_at = CURRENT_TIMESTAMP
+      WHERE substr(phone, -10) = substr(?, -10) AND status = 'payment_pending'
+    `).bind(phone).run();
+  }
+}
+
+function orderPhone(payload: any): string | null {
+  const attributes = Array.isArray(payload?.note_attributes) ? payload.note_attributes : [];
+  const attributePhone = attributes.find((attribute: any) =>
+    normalize(String(attribute?.name ?? "")) === "whatsapp phone",
+  )?.value;
+  const candidates = [
+    attributePhone,
+    payload?.phone,
+    payload?.shipping_address?.phone,
+    payload?.billing_address?.phone,
+    payload?.customer?.phone,
+  ];
+  for (const candidate of candidates) {
+    const normalized = normalizeWhatsAppPhone(String(candidate ?? ""));
+    if (normalized) return normalized;
+  }
+  return null;
+}
+
+function deriveOrderStatusLabel(input: {
+  financialStatus: string;
+  fulfillmentStatus: string;
+  shipmentStatus: string;
+  cancelledAt: string;
+  trackingNumber: string;
+  trackingUrl: string;
+}): string {
+  const shipment = normalize(input.shipmentStatus);
+  if (input.cancelledAt) return "Cancelled";
+  if (shipment === "delivered") return "Delivered";
+  if (["out for delivery", "out_for_delivery"].includes(shipment)) return "Out for delivery";
+  if (["in transit", "in_transit"].includes(shipment)) return "In transit";
+  if (input.trackingNumber || input.trackingUrl) return "Dispatched";
+  if (normalize(input.fulfillmentStatus) === "fulfilled") return "Fulfilled";
+  if (normalize(input.fulfillmentStatus) === "partial") return "Partially fulfilled";
+  if (normalize(input.financialStatus) === "paid") return "Payment received — processing";
+  if (["pending", "authorized", "partially paid", "partially_paid"].includes(normalize(input.financialStatus))) {
+    return "Payment pending";
+  }
+  return "Order confirmed";
+}
+
+async function updateShopifyOrderFromFulfillment(env: Bindings, payload: any): Promise<void> {
+  const orderId = String(payload?.order_id ?? "").trim();
+  if (!orderId) return;
+  const trackingNumber = String(payload?.tracking_number ?? payload?.tracking_numbers?.[0] ?? "");
+  const trackingUrl = String(payload?.tracking_url ?? payload?.tracking_urls?.[0] ?? "");
+  const shipmentStatus = String(payload?.shipment_status ?? "");
+  const statusLabel = deriveOrderStatusLabel({
+    financialStatus: "paid",
+    fulfillmentStatus: "fulfilled",
+    shipmentStatus,
+    cancelledAt: "",
+    trackingNumber,
+    trackingUrl,
+  });
+  await env.DB.prepare(`
+    UPDATE shopify_orders
+    SET fulfillment_status = 'fulfilled', shipment_status = ?, status_label = ?,
+        tracking_company = ?, tracking_number = ?, tracking_url = ?, updated_at = CURRENT_TIMESTAMP
+    WHERE order_id = ? OR order_id = ?
+  `)
+    .bind(
+      shipmentStatus,
+      statusLabel,
+      String(payload?.tracking_company ?? ""),
+      trackingNumber,
+      trackingUrl,
+      orderId,
+      `gid://shopify/Order/${orderId}`,
+    )
+    .run();
+}
+
+async function notifyOrderUpdateInsideCustomerWindow(
+  env: Bindings,
+  topic: string,
+  payload: any,
+): Promise<void> {
+  if (topic !== "orders/paid") return;
+  const phone = orderPhone(payload);
+  if (!phone || !(await hasOpenCustomerServiceWindow(env, phone))) return;
+  const orderName = String(payload?.name ?? `#${payload?.order_number ?? ""}`);
+  const total = formatCheckoutAmount(Number(payload?.current_total_price ?? payload?.total_price ?? 0), String(payload?.currency ?? "INR"));
+  const message = `🎉 Payment successful!\n\nOrder: ${orderName}\nPaid amount: ${total}\nStatus: Payment received — processing\n\nTracking details dispatch ke baad isi order status mein milengi.`;
+  try {
+    await replyAndLog(env, phone, message);
+  } catch (error) {
+    console.error("Payment confirmation WhatsApp send skipped/failed:", error);
+  }
+}
+
+async function notifyFulfillmentUpdateInsideCustomerWindow(
+  env: Bindings,
+  payload: any,
+): Promise<void> {
+  const orderId = String(payload?.order_id ?? "");
+  if (!orderId) return;
+  const order = await env.DB.prepare(`
+    SELECT phone, order_name, order_number, tracking_company, tracking_number, tracking_url, status_label
+    FROM shopify_orders
+    WHERE order_id = ? OR order_id = ?
+    LIMIT 1
+  `).bind(orderId, `gid://shopify/Order/${orderId}`).first<any>();
+  if (!order?.phone || !(await hasOpenCustomerServiceWindow(env, order.phone))) return;
+  const message = `📦 Order update\n\nOrder: ${order.order_name || `#${order.order_number}`}\nStatus: ${order.status_label || "Dispatched"}${order.tracking_company ? `\nCourier: ${order.tracking_company}` : ""}${order.tracking_number ? `\nTracking: ${order.tracking_number}` : ""}${order.tracking_url ? `\nTrack: ${order.tracking_url}` : ""}`;
+  try {
+    await replyAndLog(env, order.phone, message);
+  } catch (error) {
+    console.error("Fulfillment notification WhatsApp send skipped/failed:", error);
+  }
+}
+
+async function hasOpenCustomerServiceWindow(env: Bindings, phone: string): Promise<boolean> {
+  const row = await env.DB.prepare(`
+    SELECT created_at
+    FROM conversations
+    WHERE phone = ? AND direction = 'in'
+    ORDER BY id DESC
+    LIMIT 1
+  `).bind(phone).first<{ created_at: string }>();
+  if (!row?.created_at) return false;
+  const timestamp = Date.parse(row.created_at.includes("T") ? row.created_at : `${row.created_at.replace(" ", "T")}Z`);
+  return Number.isFinite(timestamp) && Date.now() - timestamp <= 24 * 60 * 60 * 1000;
+}
+
+function humanizeStatus(value: string): string {
+  return value.replace(/_/g, " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
 
 async function getRecommendationContext(
