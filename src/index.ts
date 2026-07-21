@@ -16,6 +16,13 @@ type Bindings = {
   ADMIN_USERNAME?: string;
   ADMIN_PASSWORD?: string;
   WHATSAPP_CATALOG_ID?: string;
+  // Live Shopify Admin lookup fallback. Use either a static Admin API token
+  // (legacy/admin-created app) OR Client ID + Client Secret (Dev Dashboard app).
+  SHOPIFY_ADMIN_DOMAIN?: string;
+  SHOPIFY_ADMIN_ACCESS_TOKEN?: string;
+  SHOPIFY_CLIENT_ID?: string;
+  SHOPIFY_CLIENT_SECRET?: string;
+  SHOPIFY_ADMIN_API_VERSION?: string;
 };
 
 type BotUser = {
@@ -123,6 +130,14 @@ type ShopifyLineItem = {
 };
 
 const app = new Hono<{ Bindings: Bindings }>();
+
+type CachedShopifyAdminToken = {
+  domain: string;
+  token: string;
+  expiresAt: number;
+};
+
+let cachedShopifyAdminToken: CachedShopifyAdminToken | null = null;
 
 const DEFAULT_SHOP_DOMAIN = "https://igstore.in";
 const SUPPORT_PHONE = "+91 95876 66693";
@@ -270,7 +285,23 @@ app.get("/shopify/order-health", async (c) => {
     FROM shopify_orders
   `).first();
 
-  return c.json({ ok: true, automation: "orders-and-tracking", counts: counts ?? {} });
+  const adminDomain = shopifyAdminDomain(c.env);
+  const liveLookupConfigured = Boolean(
+    adminDomain &&
+      (c.env.SHOPIFY_ADMIN_ACCESS_TOKEN?.trim() ||
+        (c.env.SHOPIFY_CLIENT_ID?.trim() && c.env.SHOPIFY_CLIENT_SECRET?.trim())),
+  );
+
+  return c.json({
+    ok: true,
+    automation: "orders-and-tracking",
+    counts: counts ?? {},
+    liveLookup: {
+      configured: liveLookupConfigured,
+      domain: adminDomain || null,
+      apiVersion: shopifyAdminApiVersion(c.env),
+    },
+  });
 });
 
 app.post("/shopify/run-abandoned", async (c) => {
@@ -2133,11 +2164,25 @@ async function findShopifyOrder(
   const digits = orderNumber.replace(/\D/g, "");
   if (!digits) return null;
 
-  // Match the Shopify order number in all common forms: 1234, #1234,
-  // IG1234, IG-1234 and "Order 1234". Prefer the same WhatsApp number,
-  // but do not reject an otherwise exact order when Shopify stored no phone
-  // or a different contact number. The status response never exposes address,
-  // email or the customer's saved phone number.
+  const localOrder = await findShopifyOrderInDatabase(env, phone, digits);
+
+  // Refresh from Shopify Admin on every lookup when credentials are configured.
+  // This prevents stale payment, fulfillment and courier status. If Shopify is
+  // temporarily unavailable, the last D1-saved order is still returned.
+  const livePayload = await fetchShopifyOrderFromAdmin(env, digits);
+  if (livePayload) {
+    await upsertShopifyOrder(env, livePayload);
+    return (await findShopifyOrderInDatabase(env, phone, digits)) ?? localOrder;
+  }
+
+  return localOrder;
+}
+
+async function findShopifyOrderInDatabase(
+  env: Bindings,
+  phone: string,
+  digits: string,
+): Promise<ShopifyOrderRow | null> {
   const row = await env.DB.prepare(`
     SELECT order_id, order_number, order_name, phone, customer_name,
            financial_status, fulfillment_status, shipment_status, status_label,
@@ -2169,14 +2214,279 @@ async function findShopifyOrder(
   return row ?? null;
 }
 
+type ShopifyAdminOrderNode = {
+  id?: string;
+  legacyResourceId?: string | number;
+  name?: string;
+  number?: number;
+  phone?: string | null;
+  displayFinancialStatus?: string | null;
+  displayFulfillmentStatus?: string | null;
+  cancelledAt?: string | null;
+  currentTotalPriceSet?: {
+    shopMoney?: { amount?: string | number; currencyCode?: string } | null;
+  } | null;
+  lineItems?: {
+    nodes?: Array<{ name?: string; quantity?: number }>;
+  } | null;
+  fulfillments?: Array<{
+    status?: string | null;
+    trackingInfo?: Array<{
+      company?: string | null;
+      number?: string | null;
+      url?: string | null;
+    }>;
+  }>;
+  statusPageUrl?: string | null;
+  shippingAddress?: { name?: string | null; phone?: string | null } | null;
+};
+
+function shopifyAdminDomain(env: Bindings): string {
+  return String(env.SHOPIFY_ADMIN_DOMAIN ?? "")
+    .trim()
+    .replace(/^https?:\/\//i, "")
+    .replace(/\/+$/, "");
+}
+
+function shopifyAdminApiVersion(env: Bindings): string {
+  const value = String(env.SHOPIFY_ADMIN_API_VERSION ?? "2026-07").trim();
+  return /^20\d{2}-(01|04|07|10)$/.test(value) ? value : "2026-07";
+}
+
+async function getShopifyAdminAccessToken(
+  env: Bindings,
+  forceRefresh = false,
+): Promise<string | null> {
+  const staticToken = env.SHOPIFY_ADMIN_ACCESS_TOKEN?.trim();
+  if (staticToken) return staticToken;
+
+  const domain = shopifyAdminDomain(env);
+  const clientId = env.SHOPIFY_CLIENT_ID?.trim();
+  const clientSecret = env.SHOPIFY_CLIENT_SECRET?.trim();
+  if (!domain || !clientId || !clientSecret) return null;
+
+  const now = Date.now();
+  if (
+    !forceRefresh &&
+    cachedShopifyAdminToken?.domain === domain &&
+    cachedShopifyAdminToken.expiresAt > now + 60_000
+  ) {
+    return cachedShopifyAdminToken.token;
+  }
+
+  const body = new URLSearchParams({
+    grant_type: "client_credentials",
+    client_id: clientId,
+    client_secret: clientSecret,
+  });
+
+  try {
+    const response = await fetch(`https://${domain}/admin/oauth/access_token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: body.toString(),
+    });
+    const payload = await response.json().catch(() => ({})) as {
+      access_token?: string;
+      expires_in?: number;
+      error?: string;
+      error_description?: string;
+    };
+
+    if (!response.ok || !payload.access_token) {
+      console.error("Shopify token request failed", {
+        status: response.status,
+        error: payload.error ?? payload.error_description ?? "unknown_error",
+      });
+      return null;
+    }
+
+    const expiresIn = Math.max(300, Number(payload.expires_in ?? 86_399));
+    cachedShopifyAdminToken = {
+      domain,
+      token: payload.access_token,
+      expiresAt: now + Math.max(60, expiresIn - 300) * 1000,
+    };
+    return payload.access_token;
+  } catch (error) {
+    console.error("Shopify token request exception", String(error));
+    return null;
+  }
+}
+
+async function fetchShopifyOrderFromAdmin(
+  env: Bindings,
+  digits: string,
+): Promise<any | null> {
+  const domain = shopifyAdminDomain(env);
+  if (!domain) {
+    console.warn("Live Shopify order lookup is not configured: SHOPIFY_ADMIN_DOMAIN missing");
+    return null;
+  }
+
+  const query = `
+    query FindOrderByNumber($query: String!) {
+      orders(first: 20, query: $query, sortKey: CREATED_AT, reverse: true) {
+        nodes {
+          id
+          legacyResourceId
+          name
+          number
+          phone
+          displayFinancialStatus
+          displayFulfillmentStatus
+          cancelledAt
+          currentTotalPriceSet {
+            shopMoney { amount currencyCode }
+          }
+          lineItems(first: 10) {
+            nodes { name quantity }
+          }
+          fulfillments(first: 10) {
+            status
+            trackingInfo { company number url }
+          }
+          statusPageUrl
+          shippingAddress { name phone }
+        }
+      }
+    }
+  `;
+
+  // The connected IG Store uses order names such as #4621. Shopify's
+  // `name:4621` search also matches that format. The broad second query is a
+  // fallback for stores that use a prefix or suffix.
+  const searchQueries = [`name:${digits}`, digits];
+
+  for (const searchQuery of searchQueries) {
+    const nodes = await executeShopifyOrderQuery(env, domain, query, searchQuery);
+    const exactOrder = nodes.find((node) => {
+      const nodeNumber = String(node.number ?? "").replace(/\D/g, "");
+      const nameDigits = String(node.name ?? "").replace(/\D/g, "");
+      return nodeNumber === digits || nameDigits === digits;
+    });
+    if (exactOrder) return shopifyAdminNodeToWebhookPayload(exactOrder);
+  }
+
+  return null;
+}
+
+async function executeShopifyOrderQuery(
+  env: Bindings,
+  domain: string,
+  query: string,
+  searchQuery: string,
+): Promise<ShopifyAdminOrderNode[]> {
+  let token = await getShopifyAdminAccessToken(env);
+  if (!token) {
+    console.warn("Live Shopify order lookup is not configured: Admin token or client credentials missing");
+    return [];
+  }
+
+  const request = async (accessToken: string) => fetch(
+    `https://${domain}/admin/api/${shopifyAdminApiVersion(env)}/graphql.json`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Shopify-Access-Token": accessToken,
+      },
+      body: JSON.stringify({ query, variables: { query: searchQuery } }),
+    },
+  );
+
+  try {
+    let response = await request(token);
+
+    // Dev Dashboard client-credential tokens expire after 24 hours. Refresh
+    // once on an authentication failure without exposing credentials.
+    if (
+      response.status === 401 &&
+      !env.SHOPIFY_ADMIN_ACCESS_TOKEN?.trim() &&
+      env.SHOPIFY_CLIENT_ID?.trim() &&
+      env.SHOPIFY_CLIENT_SECRET?.trim()
+    ) {
+      cachedShopifyAdminToken = null;
+      token = await getShopifyAdminAccessToken(env, true);
+      if (token) response = await request(token);
+    }
+
+    const payload = await response.json().catch(() => ({})) as {
+      data?: { orders?: { nodes?: ShopifyAdminOrderNode[] } };
+      errors?: Array<{ message?: string }>;
+    };
+
+    if (!response.ok || payload.errors?.length) {
+      console.error("Shopify live order query failed", {
+        status: response.status,
+        errors: payload.errors?.map((item) => item.message).filter(Boolean).slice(0, 3) ?? [],
+      });
+      return [];
+    }
+
+    return Array.isArray(payload.data?.orders?.nodes)
+      ? payload.data!.orders!.nodes!
+      : [];
+  } catch (error) {
+    console.error("Shopify live order query exception", String(error));
+    return [];
+  }
+}
+
+function shopifyAdminNodeToWebhookPayload(node: ShopifyAdminOrderNode): any {
+  const money = node.currentTotalPriceSet?.shopMoney;
+  const lineItems = Array.isArray(node.lineItems?.nodes) ? node.lineItems!.nodes! : [];
+  const fulfillments = Array.isArray(node.fulfillments) ? node.fulfillments : [];
+
+  return {
+    id: String(node.legacyResourceId ?? node.id ?? ""),
+    admin_graphql_api_id: String(node.id ?? ""),
+    order_number: Number(node.number ?? 0),
+    name: String(node.name ?? ""),
+    phone: String(node.phone ?? ""),
+    shipping_address: {
+      name: String(node.shippingAddress?.name ?? ""),
+      phone: String(node.shippingAddress?.phone ?? ""),
+    },
+    financial_status: graphqlStatusToRest(node.displayFinancialStatus),
+    fulfillment_status: graphqlStatusToRest(node.displayFulfillmentStatus),
+    cancelled_at: String(node.cancelledAt ?? ""),
+    current_total_price: Number(money?.amount ?? 0),
+    currency: String(money?.currencyCode ?? "INR"),
+    order_status_url: String(node.statusPageUrl ?? ""),
+    line_items: lineItems.map((item) => ({
+      title: String(item.name ?? "Product"),
+      quantity: Number(item.quantity ?? 1),
+    })),
+    fulfillments: fulfillments.map((fulfillment) => {
+      const tracking = Array.isArray(fulfillment.trackingInfo)
+        ? fulfillment.trackingInfo.find((item) => item?.number || item?.url) ?? fulfillment.trackingInfo[0]
+        : undefined;
+      return {
+        status: graphqlStatusToRest(fulfillment.status),
+        tracking_company: String(tracking?.company ?? ""),
+        tracking_number: String(tracking?.number ?? ""),
+        tracking_url: String(tracking?.url ?? ""),
+      };
+    }),
+  };
+}
+
+function graphqlStatusToRest(value: string | null | undefined): string {
+  return String(value ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/_/g, " ");
+}
+
 function orderNotFoundMessage(language: Language, orderNumber: string): string {
   if (language === "hi") {
-    return `ऑर्डर #${orderNumber} अभी tracking system में sync नहीं मिला। कृपया order number दोबारा check करें। फिर भी issue रहे तो *Support* लिखें या ${SUPPORT_PHONE} पर संपर्क करें।`;
+    return `ऑर्डर #${orderNumber} नहीं मिला। कृपया Shopify confirmation में दिख रहा केवल 4 अंकों वाला order number भेजें, जैसे *4621* या *#4621*।`;
   }
   if (language === "en") {
-    return `Order #${orderNumber} is not synced in the tracking system yet. Please recheck the order number. If it still does not appear, reply *Support* or contact ${SUPPORT_PHONE}.`;
+    return `Order #${orderNumber} was not found. Please send the 4-digit order number shown in your Shopify confirmation, for example *4621* or *#4621*.`;
   }
-  return `Order #${orderNumber} abhi tracking system mein sync nahi mila. Order number dobara check karein. Phir bhi issue rahe to *Support* likhein ya ${SUPPORT_PHONE} par contact karein.`;
+  return `Order #${orderNumber} nahi mila. Shopify confirmation mein dikh raha 4-digit order number bhejein, jaise *4621* ya *#4621*.`;
 }
 
 function formatOrderStatusMessage(language: Language, order: ShopifyOrderRow): string {
