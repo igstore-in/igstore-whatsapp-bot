@@ -15,6 +15,7 @@ type Bindings = {
   ABANDONED_FALLBACK_IMAGE_URL?: string;
   ADMIN_USERNAME?: string;
   ADMIN_PASSWORD?: string;
+  WHATSAPP_CATALOG_ID?: string;
 };
 
 type BotUser = {
@@ -33,6 +34,17 @@ type ProductSuggestion = {
     url?: string;
     alt?: string;
   } | string;
+  body?: string;
+  description?: string;
+  product_type?: string;
+  tags?: string[] | string;
+  catalogue_id?: string;
+};
+
+type RecommendationContext = {
+  query: string;
+  budget: number | null;
+  reference_pending: number;
 };
 
 type Category = {
@@ -428,7 +440,16 @@ async function processMessage(env: Bindings, message: any): Promise<void> {
   }
 
   if (incoming.kind === "media") {
-    await replyAndLog(env, from, mediaReply(user.language));
+    if (incoming.mediaType === "image") {
+      await saveRecommendationContext(env, from, {
+        query: "",
+        budget: null,
+        reference_pending: 1,
+      });
+      await replyAndLog(env, from, referenceImageReceivedMessage(user.language));
+    } else {
+      await replyAndLog(env, from, mediaReply(user.language));
+    }
     return;
   }
 
@@ -463,22 +484,79 @@ async function processMessage(env: Bindings, message: any): Promise<void> {
     return;
   }
 
+  const context = await getRecommendationContext(env, from);
+  const budget = extractBudget(text);
+
+  if (context?.reference_pending) {
+    const referenceQuery = buildRecommendationQuery(text);
+    if (hasSpecificProductRequirement(referenceQuery)) {
+      const products = await searchProducts(env, referenceQuery);
+      const selected = rankAndFilterProducts(products, referenceQuery, budget).slice(0, 2);
+
+      if (selected.length > 0) {
+        await replyAndLog(env, from, referenceClosestOptionsMessage(user.language));
+        await sendProductCards(env, from, user.language, selected);
+        await clearRecommendationContext(env, from);
+      } else {
+        await replyAndLog(env, from, noVerifiedProductMessage(user.language));
+      }
+    } else {
+      await replyAndLog(env, from, referenceDetailsNeededMessage(user.language));
+    }
+    return;
+  }
+
+  if (context && budget !== null && isBudgetOnlyMessage(normalized)) {
+    await recommendProducts(env, from, user.language, context.query || "personalized gift", budget, 3);
+    await clearRecommendationContext(env, from);
+    return;
+  }
+
+  if (isGiftRecommendationIntent(normalized)) {
+    const recommendationQuery = buildRecommendationQuery(text) || "personalized gift";
+
+    if (budget === null) {
+      await saveRecommendationContext(env, from, {
+        query: recommendationQuery,
+        budget: null,
+        reference_pending: 0,
+      });
+      await replyAndLog(env, from, askBudgetMessage(user.language));
+      return;
+    }
+
+    await recommendProducts(env, from, user.language, recommendationQuery, budget, 3);
+    await clearRecommendationContext(env, from);
+    return;
+  }
+
   if (normalized === "7" || isBudgetCommand(normalized)) {
-    await replyAndLog(env, from, budgetMessage(user.language, shopDomain(env)));
+    if (budget === null) {
+      await saveRecommendationContext(env, from, {
+        query: "personalized gift",
+        budget: null,
+        reference_pending: 0,
+      });
+      await replyAndLog(env, from, askBudgetAndOccasionMessage(user.language));
+      return;
+    }
+
+    await recommendProducts(env, from, user.language, "personalized gift", budget, 3);
     return;
   }
 
   const category = CATEGORIES[normalized];
   if (category) {
     const products = await searchProducts(env, category.query);
+    const selected = rankAndFilterProducts(products, category.query, null).slice(0, 3);
     await replyAndLog(
       env,
       from,
       categoryIntroMessage(user.language, category, shopDomain(env)),
     );
 
-    if (products.length > 0) {
-      await sendProductCards(env, from, user.language, products.slice(0, 3));
+    if (selected.length > 0) {
+      await sendProductCards(env, from, user.language, selected);
     } else {
       await replyAndLog(env, from, noCategoryProductsMessage(user.language));
     }
@@ -486,9 +564,10 @@ async function processMessage(env: Bindings, message: any): Promise<void> {
   }
 
   const products = await searchProducts(env, text);
-  if (products.length > 0) {
-    await replyAndLog(env, from, productSearchIntro(user.language));
-    await sendProductCards(env, from, user.language, products.slice(0, 3));
+  const selected = rankAndFilterProducts(products, text, budget).slice(0, 3);
+  if (selected.length > 0) {
+    await replyAndLog(env, from, productSearchIntro(user.language, budget));
+    await sendProductCards(env, from, user.language, selected);
     return;
   }
 
@@ -497,7 +576,7 @@ async function processMessage(env: Bindings, message: any): Promise<void> {
 
 function getIncomingContent(message: any):
   | { kind: "text"; text: string; logText: string }
-  | { kind: "media"; logText: string }
+  | { kind: "media"; mediaType: string; logText: string }
   | { kind: "unsupported"; logText: string } {
   if (message?.type === "text" && typeof message?.text?.body === "string") {
     return { kind: "text", text: message.text.body, logText: message.text.body };
@@ -518,7 +597,11 @@ function getIncomingContent(message: any):
   }
 
   if (["image", "video", "document", "audio", "sticker"].includes(message?.type)) {
-    return { kind: "media", logText: `[${message.type}]` };
+    return {
+      kind: "media",
+      mediaType: String(message.type),
+      logText: `[${message.type}]`,
+    };
   }
 
   return { kind: "unsupported", logText: `[${String(message?.type ?? "unknown")}]` };
@@ -560,9 +643,73 @@ function isOrderCommand(value: string): boolean {
 }
 
 function isBudgetCommand(value: string): boolean {
-  return ["budget", "under", "below", "cheap gift", "gift under"].some((term) =>
+  return ["budget", "under", "below", "tak", "तक", "cheap gift", "gift under"].some((term) =>
     value.includes(term),
   );
+}
+
+function isGiftRecommendationIntent(value: string): boolean {
+  return [
+    "gift", "suggest", "recommend", "birthday", "anniversary", "wedding", "rakhi",
+    "wife", "husband", "girlfriend", "boyfriend", "mother", "father", "friend",
+    "भेट", "गिफ्ट", "जन्मदिन", "सालगिरह", "शादी",
+  ].some((term) => value.includes(term));
+}
+
+function extractBudget(value: string): number | null {
+  const normalizedValue = value.toLowerCase().replace(/,/g, "");
+  const hasBudgetLanguage = /(₹|rs\.?|inr|budget|under|below|tak|तक|के अंदर|से कम)/i.test(normalizedValue);
+  const standaloneNumber = /^\s*(?:₹|rs\.?|inr)?\s*(\d{2,6})\s*$/i.exec(normalizedValue);
+  const contextualNumber = /(?:₹|rs\.?|inr)?\s*(\d{2,6})(?:\s*(?:tak|तक|under|below|budget|के अंदर|से कम))?/i.exec(normalizedValue);
+  const match = standaloneNumber ?? (hasBudgetLanguage ? contextualNumber : null);
+  if (!match) return null;
+
+  const amount = Number(match[1]);
+  return Number.isFinite(amount) && amount >= 50 && amount <= 500000 ? amount : null;
+}
+
+function isBudgetOnlyMessage(value: string): boolean {
+  return /^(?:rs\.?\s*)?\d{2,6}(?:\s*(?:tak|under|budget|तक))?$/.test(value);
+}
+
+function buildRecommendationQuery(value: string): string {
+  return value
+    .replace(/₹\s*\d[\d,]*/gi, " ")
+    .replace(/\b(?:rs\.?|inr)\s*\d[\d,]*/gi, " ")
+    .replace(/\b\d[\d,]*\s*(?:tak|under|below|budget)\b/gi, " ")
+    .replace(/\b(?:please|chahiye|dikhao|dikhaye|suggest|recommend|best|option|options)\b/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 120);
+}
+
+function hasSpecificProductRequirement(value: string): boolean {
+  const normalizedValue = normalize(value);
+  return [
+    "name", "cutout", "frame", "keychain", "plate", "neon", "lamp", "photo",
+    "wooden", "acrylic", "black", "gold", "silver", "rakhi", "hamper",
+    "नेम", "फ्रेम", "कीचेन", "लकड़ी", "ब्लैक", "गोल्ड",
+  ].some((term) => normalizedValue.includes(term));
+}
+
+async function recommendProducts(
+  env: Bindings,
+  phone: string,
+  language: Language,
+  query: string,
+  budget: number | null,
+  maximum: number,
+): Promise<void> {
+  const products = await searchProducts(env, query);
+  const selected = rankAndFilterProducts(products, query, budget).slice(0, Math.min(3, maximum));
+
+  if (selected.length === 0) {
+    await replyAndLog(env, phone, noVerifiedRecommendationMessage(language, budget));
+    return;
+  }
+
+  await replyAndLog(env, phone, recommendationIntroMessage(language, budget, selected.length));
+  await sendProductCards(env, phone, language, selected);
 }
 
 async function searchProducts(env: Bindings, query: string): Promise<ProductSuggestion[]> {
@@ -572,12 +719,12 @@ async function searchProducts(env: Bindings, query: string): Promise<ProductSugg
   const url = new URL(`${shopDomain(env)}/search/suggest.json`);
   url.searchParams.set("q", cleanedQuery);
   url.searchParams.set("resources[type]", "product");
-  url.searchParams.set("resources[limit]", "5");
+  url.searchParams.set("resources[limit]", "10");
   url.searchParams.set("resources[limit_scope]", "each");
   url.searchParams.set("resources[options][unavailable_products]", "hide");
   url.searchParams.set(
     "resources[options][fields]",
-    "title,product_type,tag,variants.title,vendor",
+    "title,body,product_type,tag,variants.title,vendor",
   );
 
   try {
@@ -591,18 +738,87 @@ async function searchProducts(env: Bindings, query: string): Promise<ProductSugg
     }
 
     const data: any = await response.json();
-    const products = data?.resources?.results?.products;
-    return Array.isArray(products) ? products.slice(0, 5) : [];
+    const products: ProductSuggestion[] = Array.isArray(data?.resources?.results?.products)
+      ? data.resources.results.products
+      : [];
+
+    return await attachCatalogueIds(env, products.slice(0, 10));
   } catch (error) {
     console.error("Shopify product search error:", error);
     return [];
   }
 }
 
-function productSearchIntro(language: Language): string {
-  if (language === "hi") return "आपके लिए ये प्रोडक्ट मिले 🎁";
-  if (language === "en") return "Here are the matching products 🎁";
-  return "Matching products / आपके लिए प्रोडक्ट 🎁";
+async function attachCatalogueIds(
+  env: Bindings,
+  products: ProductSuggestion[],
+): Promise<ProductSuggestion[]> {
+  const enriched: ProductSuggestion[] = [];
+
+  for (const product of products) {
+    try {
+      const productUrl = absoluteUrl(shopDomain(env), product.url);
+      const row = await env.DB.prepare(
+        "SELECT catalogue_id FROM product_catalogue_map WHERE product_url = ? LIMIT 1",
+      )
+        .bind(productUrl)
+        .first<{ catalogue_id: string }>();
+      enriched.push({ ...product, catalogue_id: row?.catalogue_id || undefined });
+    } catch {
+      enriched.push(product);
+    }
+  }
+
+  return enriched;
+}
+
+function rankAndFilterProducts(
+  products: ProductSuggestion[],
+  request: string,
+  budget: number | null,
+): ProductSuggestion[] {
+  const normalizedRequest = normalize(request);
+  const requestTokens = normalizedRequest
+    .split(" ")
+    .filter((token) => token.length >= 3 && !["gift", "chahiye", "best", "show"].includes(token));
+  const seen = new Set<string>();
+
+  return products
+    .filter((product) => {
+      if (!product?.title?.trim() || !product?.url?.trim()) return false;
+      if (product.available === false) return false;
+
+      const key = product.url.trim().toLowerCase();
+      if (seen.has(key)) return false;
+      seen.add(key);
+
+      if (budget !== null) {
+        const price = numericProductPrice(product);
+        if (price === null || price > budget) return false;
+      }
+
+      return true;
+    })
+    .map((product) => {
+      const title = normalize(product.title);
+      let score = 0;
+      if (title.includes(normalizedRequest) || normalizedRequest.includes(title)) score += 100;
+      for (const token of requestTokens) {
+        if (title.includes(token)) score += 15;
+      }
+      if (productImageUrl(product)) score += 10;
+      if (numericProductPrice(product) !== null) score += 5;
+      return { product, score };
+    })
+    .sort((a, b) => b.score - a.score)
+    .map((entry) => entry.product);
+}
+
+function productSearchIntro(language: Language, budget: number | null): string {
+  if (budget !== null) return recommendationIntroMessage(language, budget, 3);
+  if (language === "hi") return "आपकी requirement के अनुसार ये verified products मिले 👇";
+  if (language === "en") return "These verified products match your requirement 👇";
+  return "Aapki requirement ke according ye verified products mile 👇";
 }
 
 function categoryIntroMessage(
@@ -617,24 +833,13 @@ function categoryIntroMessage(
         ? `*${category.labelHi}*`
         : `*${category.labelEn} / ${category.labelHi}*`;
 
-  const browseLabel =
-    language === "hi"
-      ? "सभी प्रोडक्ट देखें"
-      : language === "en"
-        ? "Browse all products"
-        : "Browse all products / सभी प्रोडक्ट देखें";
-
-  return `${heading}
-${browseLabel}:
-${absoluteUrl(domain, category.collectionUrl)}
-
-Top products with images:`;
+  return `${heading}\nVerified available options 👇`;
 }
 
 function noCategoryProductsMessage(language: Language): string {
-  if (language === "hi") return "इस कैटेगरी में अभी कोई प्रोडक्ट नहीं मिला। कृपया ऊपर दिया collection link खोलें।";
-  if (language === "en") return "No products were found in this category right now. Please open the collection link above.";
-  return "No products found right now. / अभी कोई प्रोडक्ट नहीं मिला। कृपया ऊपर दिया collection link खोलें।";
+  if (language === "hi") return "इस category में verified available product अभी नहीं मिला। Team से confirm करने के लिए *Support* लिखें।";
+  if (language === "en") return "No verified available product was found in this category. Reply *Support* for confirmation.";
+  return "Is category mein verified available product abhi nahi mila. Team confirmation ke liye *Support* likhein.";
 }
 
 async function sendProductCards(
@@ -643,9 +848,28 @@ async function sendProductCards(
   language: Language,
   products: ProductSuggestion[],
 ): Promise<void> {
-  for (const product of products) {
-    const caption = productCaption(language, product, shopDomain(env));
+  const safeProducts = products.slice(0, 3);
+
+  for (let index = 0; index < safeProducts.length; index += 1) {
+    const product = safeProducts[index];
+    const caption = productCaption(language, product, shopDomain(env), index + 1);
     const imageUrl = productImageUrl(product);
+
+    if (env.WHATSAPP_CATALOG_ID?.trim() && product.catalogue_id?.trim()) {
+      try {
+        await sendCatalogueProduct(env, phone, product.catalogue_id, caption);
+        await saveConversation(
+          env,
+          phone,
+          "out",
+          `[catalogue:${product.catalogue_id}] ${caption}`,
+          null,
+        );
+        continue;
+      } catch (error) {
+        console.error("Catalogue product send failed; falling back to image:", error);
+      }
+    }
 
     if (imageUrl) {
       try {
@@ -660,32 +884,48 @@ async function sendProductCards(
     await replyAndLog(env, phone, caption);
   }
 
-  await replyAndLog(env, phone, productCardsFooter(language));
+  await replyAndLog(
+    env,
+    phone,
+    productCardsFooter(language, safeProducts.length, safeProducts.some(isCustomProduct)),
+  );
 }
 
 function productCaption(
   language: Language,
   product: ProductSuggestion,
   domain: string,
+  optionNumber: number,
 ): string {
   const price = formatPrice(product.price_min ?? product.price);
   const url = absoluteUrl(domain, product.url);
+  const description = verifiedShortDescription(product);
 
   if (language === "hi") {
-    return `*${product.title}*
-${price ? `शुरुआती कीमत: ${price}
-` : ""}ऑर्डर करें: ${url}`;
+    return `${optionNumber}. *${product.title}*\n${price ? `शुरुआती कीमत: ${price}\n` : ""}${description ? `${description}\n` : ""}🛒 ऑर्डर/जानकारी: ${url}`;
   }
 
   if (language === "en") {
-    return `*${product.title}*
-${price ? `Starting price: ${price}
-` : ""}Order now: ${url}`;
+    return `${optionNumber}. *${product.title}*\n${price ? `Starting price: ${price}\n` : ""}${description ? `${description}\n` : ""}🛒 Order/Details: ${url}`;
   }
 
-  return `*${product.title}*
-${price ? `Starting price / शुरुआती कीमत: ${price}
-` : ""}Order now / ऑर्डर करें: ${url}`;
+  return `${optionNumber}. *${product.title}*\n${price ? `Starting Price: ${price}\n` : ""}${description ? `${description}\n` : ""}🛒 Order/Details: ${url}`;
+}
+
+function verifiedShortDescription(product: ProductSuggestion): string {
+  const raw = typeof product.body === "string"
+    ? product.body
+    : typeof product.description === "string"
+      ? product.description
+      : "";
+
+  return raw
+    .replace(/<[^>]*>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 140);
 }
 
 function productImageUrl(product: ProductSuggestion): string | null {
@@ -699,17 +939,111 @@ function productImageUrl(product: ProductSuggestion): string | null {
   return url;
 }
 
-function productCardsFooter(language: Language): string {
-  if (language === "hi") return "मुख्य मेनू के लिए *Menu* लिखें या किसी दूसरे प्रोडक्ट का नाम भेजें।";
-  if (language === "en") return "Reply *Menu* for the main menu or send another product name.";
-  return `Reply *Menu* for the main menu or send another product name.
-मुख्य मेनू के लिए *Menu* लिखें।`;
+function productCardsFooter(
+  language: Language,
+  productCount: number,
+  hasCustomProduct: boolean,
+): string {
+  const variationNote = hasCustomProduct
+    ? "\nCustom product handmade/personalized hone ke karan minor variation possible hai."
+    : "";
+
+  if (language === "hi") {
+    const question = productCount === 1
+      ? "आपको यह design पसंद है? Size और customization बता दें 😊"
+      : `इनमें से कौन-सा option पसंद आया—${Array.from({ length: productCount }, (_, i) => i + 1).join(", ")}?`;
+    return `${question}${variationNote}`;
+  }
+
+  if (language === "en") {
+    const question = productCount === 1
+      ? "Do you like this design? Please share the size and customization 😊"
+      : `Which option do you like—${Array.from({ length: productCount }, (_, i) => i + 1).join(", ")}?`;
+    return `${question}${variationNote}`;
+  }
+
+  const question = productCount === 1
+    ? "Aapko ye design pasand hai? Size aur customization bata dein 😊"
+    : `Inmein se kaunsa option pasand aaya—${Array.from({ length: productCount }, (_, i) => i + 1).join(", ")}?`;
+  return `${question}${variationNote}`;
+}
+
+function numericProductPrice(product: ProductSuggestion): number | null {
+  const value = Number(product.price_min ?? product.price);
+  return Number.isFinite(value) ? value : null;
 }
 
 function formatPrice(value: unknown): string | null {
   const number = Number(value);
   if (!Number.isFinite(number)) return null;
   return `₹${Number.isInteger(number) ? number.toFixed(0) : number.toFixed(2)}`;
+}
+
+function isCustomProduct(product: ProductSuggestion): boolean {
+  return /(custom|personalized|personalised|name|photo|neon|cutout)/i.test(product.title);
+}
+
+function recommendationIntroMessage(
+  language: Language,
+  budget: number | null,
+  count: number,
+): string {
+  if (language === "hi") {
+    return budget !== null
+      ? `₹${budget} के budget में ये ${count} verified options best हैं 👇`
+      : `ये ${count} verified options best हैं 👇`;
+  }
+  if (language === "en") {
+    return budget !== null
+      ? `These ${count} verified options are within your ₹${budget} budget 👇`
+      : `These ${count} verified options are the best match 👇`;
+  }
+  return budget !== null
+    ? `₹${budget} ke budget mein ye ${count} verified options best hain 👇`
+    : `Ye ${count} verified options best match hain 👇`;
+}
+
+function askBudgetMessage(language: Language): string {
+  if (language === "hi") return "बिल्कुल 😊 आपका approximate budget कितना है?";
+  if (language === "en") return "Sure 😊 What is your approximate budget?";
+  return "Bilkul 😊 Aapka approximate budget kitna hai?";
+}
+
+function askBudgetAndOccasionMessage(language: Language): string {
+  if (language === "hi") return "अपना budget और occasion बताएं, जैसे: ‘Anniversary gift ₹1000 तक’।";
+  if (language === "en") return "Please share the budget and occasion, for example: ‘Anniversary gift under ₹1000’.";
+  return "Apna budget aur occasion batayein, jaise: ‘Anniversary gift ₹1000 tak’.";
+}
+
+function noVerifiedRecommendationMessage(language: Language, budget: number | null): string {
+  const budgetText = budget !== null ? ` ₹${budget}` : "";
+  if (language === "hi") return `${budgetText} budget में verified image, price और availability वाला matching product नहीं मिला। गलत product दिखाने के बजाय team से confirm करने के लिए *Support* लिखें।`;
+  if (language === "en") return `No matching product with verified image, price and availability was found for the${budgetText} budget. Reply *Support* for team confirmation.`;
+  return `${budgetText} budget mein verified image, price aur availability wala matching product nahi mila. Team confirmation ke liye *Support* likhein.`;
+}
+
+function noVerifiedProductMessage(language: Language): string {
+  if (language === "hi") return "इस requirement के लिए verified matching product image अभी नहीं मिली। गलत image दिखाने के बजाय product type, colour और budget बताएं।";
+  if (language === "en") return "A verified matching product image is not available yet. Please share the product type, colour and budget.";
+  return "Is requirement ke liye verified matching product image abhi nahi mili. Product type, colour aur budget batayein.";
+}
+
+function referenceImageReceivedMessage(language: Language): string {
+  if (language === "hi") return "Reference image मिल गई ✅ आपको same design चाहिए या इसमें changes करने हैं? Product type, colour और budget भी बता दें।";
+  if (language === "en") return "Reference image received ✅ Do you need the same design or any changes? Please also share the product type, colour and budget.";
+  return "Reference image mil gayi ✅ Aapko same design chahiye ya isme changes karne hain? Product type, colour aur budget bhi bata dein.";
+}
+
+function referenceDetailsNeededMessage(language: Language): string {
+  if (language === "hi") return "सबसे close IG Store options दिखाने के लिए product type, colour और approximate budget बताएं।";
+  if (language === "en") return "Please share the product type, colour and approximate budget so I can show the closest IG Store options.";
+  return "Sabse close IG Store options dikhane ke liye product type, colour aur approximate budget batayein.";
+}
+
+function referenceClosestOptionsMessage(language: Language): string {
+  if (language === "hi") return "आपकी reference requirement के सबसे close verified IG Store options ये हैं 👇";
+  if (language === "en") return "These are the closest verified IG Store options for your reference requirement 👇";
+  return "Aapki reference requirement ke sabse close verified IG Store options ye hain 👇";
 }
 
 function absoluteUrl(domain: string, path: string): string {
@@ -1245,6 +1579,46 @@ function formatCheckoutAmount(amount: number, currency: string): string {
   return `${String(currency || "INR").toUpperCase()} ${safeAmount.toFixed(2)}`;
 }
 
+async function sendCatalogueProduct(
+  env: Bindings,
+  to: string,
+  catalogueId: string,
+  bodyText: string,
+): Promise<void> {
+  const graphVersion = env.META_GRAPH_VERSION?.trim() || "v25.0";
+  const endpoint = `https://graph.facebook.com/${graphVersion}/${env.WHATSAPP_PHONE_NUMBER_ID}/messages`;
+  const catalogId = env.WHATSAPP_CATALOG_ID?.trim();
+  if (!catalogId) throw new Error("WHATSAPP_CATALOG_ID is not configured");
+
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${env.WHATSAPP_ACCESS_TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      messaging_product: "whatsapp",
+      recipient_type: "individual",
+      to,
+      type: "interactive",
+      interactive: {
+        type: "product",
+        body: { text: bodyText.slice(0, 1024) },
+        action: {
+          catalog_id: catalogId,
+          product_retailer_id: catalogueId,
+        },
+      },
+    }),
+  });
+
+  const responseBody = await response.text();
+  console.log(`WhatsApp catalogue product status: ${response.status}`, responseBody);
+  if (!response.ok) {
+    throw new Error(`WhatsApp catalogue product request failed with status ${response.status}`);
+  }
+}
+
 async function sendText(env: Bindings, to: string, body: string): Promise<void> {
   const graphVersion = env.META_GRAPH_VERSION?.trim() || "v25.0";
   const endpoint = `https://graph.facebook.com/${graphVersion}/${env.WHATSAPP_PHONE_NUMBER_ID}/messages`;
@@ -1349,6 +1723,22 @@ async function initializeDatabase(env: Bindings): Promise<void> {
       )
     `),
     env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS recommendation_context (
+        phone TEXT PRIMARY KEY,
+        query TEXT NOT NULL DEFAULT '',
+        budget REAL,
+        reference_pending INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )
+    `),
+    env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS product_catalogue_map (
+        product_url TEXT PRIMARY KEY,
+        catalogue_id TEXT NOT NULL,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )
+    `),
+    env.DB.prepare(`
       CREATE TABLE IF NOT EXISTS processed_shopify_webhooks (
         webhook_id TEXT PRIMARY KEY,
         processed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -1387,6 +1777,52 @@ async function initializeDatabase(env: Bindings): Promise<void> {
       ON abandoned_checkouts(status, due_at)
     `),
   ]);
+}
+
+async function getRecommendationContext(
+  env: Bindings,
+  phone: string,
+): Promise<RecommendationContext | null> {
+  const row = await env.DB.prepare(
+    `SELECT query, budget, reference_pending
+     FROM recommendation_context
+     WHERE phone = ?
+     LIMIT 1`,
+  )
+    .bind(phone)
+    .first<{ query: string; budget: number | null; reference_pending: number }>();
+
+  return row
+    ? {
+        query: row.query || "",
+        budget: row.budget === null ? null : Number(row.budget),
+        reference_pending: Number(row.reference_pending || 0),
+      }
+    : null;
+}
+
+async function saveRecommendationContext(
+  env: Bindings,
+  phone: string,
+  context: RecommendationContext,
+): Promise<void> {
+  await env.DB.prepare(`
+    INSERT INTO recommendation_context (phone, query, budget, reference_pending, updated_at)
+    VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+    ON CONFLICT(phone) DO UPDATE SET
+      query = excluded.query,
+      budget = excluded.budget,
+      reference_pending = excluded.reference_pending,
+      updated_at = CURRENT_TIMESTAMP
+  `)
+    .bind(phone, context.query.slice(0, 160), context.budget, context.reference_pending)
+    .run();
+}
+
+async function clearRecommendationContext(env: Bindings, phone: string): Promise<void> {
+  await env.DB.prepare("DELETE FROM recommendation_context WHERE phone = ?")
+    .bind(phone)
+    .run();
 }
 
 async function markMessageAsNew(env: Bindings, messageId: string): Promise<boolean> {
