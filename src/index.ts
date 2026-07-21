@@ -13,6 +13,8 @@ type Bindings = {
   ABANDONED_TEMPLATE_NAME?: string;
   ABANDONED_TEMPLATE_LANGUAGE?: string;
   ABANDONED_FALLBACK_IMAGE_URL?: string;
+  ADMIN_USERNAME?: string;
+  ADMIN_PASSWORD?: string;
 };
 
 type BotUser = {
@@ -183,11 +185,11 @@ app.get("/shopify/health", async (c) => {
   await initializeDatabase(c.env);
   const counts = await c.env.DB.prepare(`
     SELECT
-      SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pending,
-      SUM(CASE WHEN status = 'sent' THEN 1 ELSE 0 END) AS sent,
-      SUM(CASE WHEN status = 'recovered' THEN 1 ELSE 0 END) AS recovered,
-      SUM(CASE WHEN status = 'skipped' THEN 1 ELSE 0 END) AS skipped,
-      SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed
+      COALESCE(SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END), 0) AS pending,
+      COALESCE(SUM(CASE WHEN status = 'sent' THEN 1 ELSE 0 END), 0) AS sent,
+      COALESCE(SUM(CASE WHEN status = 'recovered' THEN 1 ELSE 0 END), 0) AS recovered,
+      COALESCE(SUM(CASE WHEN status = 'skipped' THEN 1 ELSE 0 END), 0) AS skipped,
+      COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) AS failed
     FROM abandoned_checkouts
   `).first();
 
@@ -208,6 +210,144 @@ app.post("/shopify/run-abandoned", async (c) => {
 
   c.executionCtx.waitUntil(processDueAbandonedCheckouts(c.env));
   return c.json({ ok: true, started: true });
+});
+
+
+app.get("/admin", (c) => c.redirect("/admin/inbox", 302));
+
+app.use("/admin/*", async (c, next) => {
+  if (!c.env.ADMIN_PASSWORD?.trim()) {
+    return c.html(
+      "<h2>Admin inbox is not configured</h2><p>Add ADMIN_PASSWORD as an encrypted Cloudflare secret.</p>",
+      503,
+    );
+  }
+
+  if (!isAdminAuthorized(c.env, c.req.header("Authorization"))) {
+    c.header("WWW-Authenticate", 'Basic realm="IG Store Inbox", charset="UTF-8"');
+    return c.text("Login required", 401);
+  }
+
+  await next();
+});
+
+app.get("/admin/inbox", async (c) => {
+  await initializeDatabase(c.env);
+  return c.html(adminInboxHtml());
+});
+
+app.get("/admin/api/chats", async (c) => {
+  await initializeDatabase(c.env);
+
+  const result = await c.env.DB.prepare(`
+    SELECT
+      c.phone,
+      COALESCE(NULLIF(ct.profile_name, ''), NULLIF((
+        SELECT a.customer_name
+        FROM abandoned_checkouts a
+        WHERE a.phone = c.phone
+        ORDER BY a.updated_at DESC
+        LIMIT 1
+      ), ''), c.phone) AS customer_name,
+      c.body AS last_message,
+      c.direction AS last_direction,
+      c.created_at AS last_at,
+      COALESCE((
+        SELECT a.status
+        FROM abandoned_checkouts a
+        WHERE a.phone = c.phone
+        ORDER BY a.updated_at DESC
+        LIMIT 1
+      ), '') AS checkout_status
+    FROM conversations c
+    INNER JOIN (
+      SELECT phone, MAX(id) AS max_id
+      FROM conversations
+      GROUP BY phone
+    ) latest ON latest.max_id = c.id
+    LEFT JOIN contacts ct ON ct.phone = c.phone
+    ORDER BY c.id DESC
+    LIMIT 200
+  `).all();
+
+  return c.json({ ok: true, chats: result.results ?? [] });
+});
+
+app.get("/admin/api/messages", async (c) => {
+  await initializeDatabase(c.env);
+  const phone = String(c.req.query("phone") ?? "").replace(/\D/g, "");
+
+  if (!/^\d{8,15}$/.test(phone)) {
+    return c.json({ ok: false, error: "Invalid phone number" }, 400);
+  }
+
+  const result = await c.env.DB.prepare(`
+    SELECT id, phone, direction, body, whatsapp_message_id, created_at
+    FROM conversations
+    WHERE phone = ?
+    ORDER BY id ASC
+    LIMIT 500
+  `)
+    .bind(phone)
+    .all();
+
+  const contact = await c.env.DB.prepare(`
+    SELECT COALESCE(NULLIF(ct.profile_name, ''), NULLIF((
+      SELECT a.customer_name
+      FROM abandoned_checkouts a
+      WHERE a.phone = ?
+      ORDER BY a.updated_at DESC
+      LIMIT 1
+    ), ''), ?) AS customer_name
+    FROM (SELECT 1) seed
+    LEFT JOIN contacts ct ON ct.phone = ?
+    LIMIT 1
+  `)
+    .bind(phone, phone, phone)
+    .first<{ customer_name: string }>();
+
+  return c.json({
+    ok: true,
+    phone,
+    customerName: contact?.customer_name || phone,
+    messages: result.results ?? [],
+  });
+});
+
+app.post("/admin/api/send", async (c) => {
+  await initializeDatabase(c.env);
+
+  let payload: any;
+  try {
+    payload = await c.req.json();
+  } catch {
+    return c.json({ ok: false, error: "Invalid request" }, 400);
+  }
+
+  const phone = normalizeWhatsAppPhone(String(payload?.phone ?? ""));
+  const body = String(payload?.body ?? "").trim();
+
+  if (!phone) return c.json({ ok: false, error: "Invalid phone number" }, 400);
+  if (!body) return c.json({ ok: false, error: "Message cannot be empty" }, 400);
+  if (body.length > 4000) {
+    return c.json({ ok: false, error: "Message is too long" }, 400);
+  }
+
+  try {
+    await sendText(c.env, phone, body);
+    await saveConversation(c.env, phone, "out", body, null);
+    return c.json({ ok: true });
+  } catch (error) {
+    console.error("Admin reply failed:", error);
+    return c.json(
+      {
+        ok: false,
+        error:
+          "WhatsApp API rejected the message. Check account restriction, token and 24-hour messaging window.",
+      },
+      502,
+    );
+  }
 });
 
 app.onError((error, c) => {
@@ -243,7 +383,20 @@ function extractMessages(payload: any): any[] {
       const valueMessages = Array.isArray(change?.value?.messages)
         ? change.value.messages
         : [];
-      messages.push(...valueMessages);
+      const contacts = Array.isArray(change?.value?.contacts)
+        ? change.value.contacts
+        : [];
+
+      for (const message of valueMessages) {
+        const from = String(message?.from ?? "");
+        const contact = contacts.find(
+          (item: any) => String(item?.wa_id ?? "") === from,
+        );
+        messages.push({
+          ...message,
+          _profileName: String(contact?.profile?.name ?? "").trim(),
+        });
+      }
     }
   }
 
@@ -265,6 +418,7 @@ async function processMessage(env: Bindings, message: any): Promise<void> {
   }
 
   const incoming = getIncomingContent(message);
+  await upsertContact(env, from, String(message?._profileName ?? ""));
   const user = await getOrCreateUser(env, from);
   await saveConversation(env, from, "in", incoming.logText, messageId);
 
@@ -496,7 +650,7 @@ async function sendProductCards(
     if (imageUrl) {
       try {
         await sendImage(env, phone, imageUrl, caption);
-        await saveConversation(env, phone, "out", `[image] ${caption}`, null);
+        await saveConversation(env, phone, "out", `[image:${imageUrl}] ${caption}`, null);
         continue;
       } catch (error) {
         console.error("Product image send failed; falling back to text:", error);
@@ -986,7 +1140,7 @@ async function processDueAbandonedCheckouts(env: Bindings): Promise<void> {
         env,
         checkout.phone,
         "out",
-        `[template:${env.ABANDONED_TEMPLATE_NAME?.trim() || DEFAULT_ABANDONED_TEMPLATE}] ${checkout.product_title}`,
+        `[image:${checkout.product_image || env.ABANDONED_FALLBACK_IMAGE_URL?.trim() || DEFAULT_FALLBACK_IMAGE}] Abandoned checkout offer sent\nProduct: ${checkout.product_title}\nCart: ${formatCheckoutAmount(checkout.total_price, checkout.currency)}\nOffer: 5% OFF above ₹499 with ${ABANDONED_OFFER_CODE}\nComplete order: ${checkout.recovery_url}`,
         null,
       );
     } catch (error) {
@@ -1178,6 +1332,13 @@ async function initializeDatabase(env: Bindings): Promise<void> {
       )
     `),
     env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS contacts (
+        phone TEXT PRIMARY KEY,
+        profile_name TEXT NOT NULL DEFAULT '',
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )
+    `),
+    env.DB.prepare(`
       CREATE TABLE IF NOT EXISTS conversations (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         phone TEXT NOT NULL,
@@ -1246,6 +1407,28 @@ async function markMessageAsNew(env: Bindings, messageId: string): Promise<boole
   return true;
 }
 
+
+async function upsertContact(
+  env: Bindings,
+  phone: string,
+  profileName: string,
+): Promise<void> {
+  const cleanName = profileName.trim().slice(0, 120);
+
+  await env.DB.prepare(`
+    INSERT INTO contacts (phone, profile_name, updated_at)
+    VALUES (?, ?, CURRENT_TIMESTAMP)
+    ON CONFLICT(phone) DO UPDATE SET
+      profile_name = CASE
+        WHEN excluded.profile_name != '' THEN excluded.profile_name
+        ELSE contacts.profile_name
+      END,
+      updated_at = CURRENT_TIMESTAMP
+  `)
+    .bind(phone, cleanName)
+    .run();
+}
+
 async function getOrCreateUser(env: Bindings, phone: string): Promise<BotUser> {
   const existing = await env.DB.prepare(
     "SELECT language FROM bot_users WHERE phone = ? LIMIT 1",
@@ -1292,6 +1475,175 @@ async function setUserLanguage(
 
 function isLanguage(value: string): value is Language {
   return value === "en" || value === "hi" || value === "both";
+}
+
+
+function isAdminAuthorized(env: Bindings, authorization?: string): boolean {
+  const expectedPassword = env.ADMIN_PASSWORD?.trim();
+  if (!expectedPassword || !authorization?.startsWith("Basic ")) return false;
+
+  try {
+    const decoded = atob(authorization.slice(6));
+    const separator = decoded.indexOf(":");
+    if (separator < 0) return false;
+
+    const username = decoded.slice(0, separator);
+    const password = decoded.slice(separator + 1);
+    const expectedUsername = env.ADMIN_USERNAME?.trim() || "admin";
+
+    return username === expectedUsername && password === expectedPassword;
+  } catch {
+    return false;
+  }
+}
+
+function adminInboxHtml(): string {
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <title>IG Store WhatsApp Inbox</title>
+  <style>
+    *{box-sizing:border-box}body{margin:0;font-family:Arial,Helvetica,sans-serif;background:#dfe5e7;color:#111827;height:100vh;overflow:hidden}
+    .app{height:100vh;max-width:1500px;margin:auto;background:#fff;display:grid;grid-template-columns:360px 1fr;box-shadow:0 0 30px rgba(0,0,0,.14)}
+    .sidebar{border-right:1px solid #d8dde1;display:flex;flex-direction:column;min-width:0;background:#fff}
+    .brand{height:68px;padding:12px 16px;background:#f0f2f5;display:flex;align-items:center;gap:12px;border-bottom:1px solid #d8dde1}
+    .logo{width:42px;height:42px;border-radius:50%;background:#00a884;color:#fff;display:grid;place-items:center;font-weight:800}
+    .brand strong{display:block;font-size:17px}.brand small{color:#667781}
+    .search{padding:10px 12px;background:#fff;border-bottom:1px solid #eef0f2}.search input{width:100%;border:0;background:#f0f2f5;border-radius:9px;padding:11px 14px;outline:none;font-size:14px}
+    .chat-list{overflow:auto;flex:1}.empty{padding:30px 18px;text-align:center;color:#667781}
+    .chat-item{padding:12px 14px;display:grid;grid-template-columns:48px 1fr auto;gap:11px;cursor:pointer;border-bottom:1px solid #f0f2f5}.chat-item:hover,.chat-item.active{background:#f0f2f5}
+    .avatar{width:48px;height:48px;border-radius:50%;background:#d9fdd3;display:grid;place-items:center;font-weight:700;color:#087b62;text-transform:uppercase}
+    .chat-main{min-width:0}.chat-name{font-size:16px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.chat-preview{font-size:13px;color:#667781;margin-top:5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.chat-time{font-size:11px;color:#667781;white-space:nowrap}.badge{display:inline-block;margin-top:6px;padding:3px 6px;border-radius:10px;background:#e7fce8;color:#087b62;font-size:10px;text-transform:capitalize}
+    .main{display:flex;flex-direction:column;min-width:0;background:#efeae2}.topbar{height:68px;background:#f0f2f5;border-bottom:1px solid #d8dde1;padding:10px 16px;display:flex;align-items:center;gap:12px}.topbar .details{min-width:0}.topbar strong{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.topbar small{color:#667781}.back{display:none;border:0;background:transparent;font-size:24px;cursor:pointer}
+    .placeholder{flex:1;display:grid;place-items:center;text-align:center;color:#667781;padding:30px}.placeholder h2{color:#41525d;font-weight:400}
+    .messages{flex:1;overflow:auto;padding:22px 7%;background-color:#efeae2;background-image:radial-gradient(rgba(17,24,39,.035) 1px,transparent 1px);background-size:18px 18px;display:none}
+    .row{display:flex;margin:4px 0}.row.in{justify-content:flex-start}.row.out{justify-content:flex-end}.bubble{max-width:min(70%,720px);padding:8px 10px 6px;border-radius:8px;box-shadow:0 1px 1px rgba(0,0,0,.09);white-space:pre-wrap;overflow-wrap:anywhere;font-size:14px;line-height:1.42}.in .bubble{background:#fff;border-top-left-radius:2px}.out .bubble{background:#d9fdd3;border-top-right-radius:2px}.msg-time{display:block;text-align:right;color:#667781;font-size:10px;margin-top:4px}
+    .composer{display:none;background:#f0f2f5;padding:10px 14px;gap:10px;align-items:flex-end}.composer textarea{flex:1;resize:none;max-height:120px;min-height:42px;border:0;border-radius:9px;padding:11px 13px;font:inherit;outline:none}.composer button{height:42px;border:0;border-radius:50%;width:42px;background:#00a884;color:#fff;font-size:18px;cursor:pointer}.composer button:disabled{opacity:.5}.status{position:fixed;right:18px;bottom:18px;background:#111827;color:#fff;padding:10px 14px;border-radius:8px;font-size:13px;display:none;z-index:10}
+    @media(max-width:760px){.app{display:block}.sidebar,.main{height:100vh}.main{display:none}.app.open-chat .sidebar{display:none}.app.open-chat .main{display:flex}.back{display:block}.messages{padding:18px 10px}.bubble{max-width:88%}}
+  </style>
+</head>
+<body>
+  <div class="app" id="app">
+    <aside class="sidebar">
+      <div class="brand"><div class="logo">IG</div><div><strong>IG Store Inbox</strong><small>WhatsApp conversations</small></div></div>
+      <div class="search"><input id="search" placeholder="Search name or phone"></div>
+      <div class="chat-list" id="chatList"><div class="empty">Loading conversations…</div></div>
+    </aside>
+    <main class="main">
+      <header class="topbar">
+        <button class="back" id="back" aria-label="Back">‹</button>
+        <div class="avatar" id="headerAvatar">IG</div>
+        <div class="details"><strong id="headerName">Select a customer</strong><small id="headerPhone">Chat history will appear here</small></div>
+      </header>
+      <section class="placeholder" id="placeholder"><div><h2>IG Store WhatsApp Inbox</h2><p>Select a customer from the left to view messages.</p></div></section>
+      <section class="messages" id="messages"></section>
+      <form class="composer" id="composer"><textarea id="messageInput" rows="1" placeholder="Type a message"></textarea><button id="sendButton" type="submit">➤</button></form>
+    </main>
+  </div>
+  <div class="status" id="status"></div>
+  <script>
+    var chats = [];
+    var selectedPhone = '';
+    var selectedName = '';
+    var loadingMessages = false;
+    var app = document.getElementById('app');
+    var chatList = document.getElementById('chatList');
+    var messages = document.getElementById('messages');
+    var placeholder = document.getElementById('placeholder');
+    var composer = document.getElementById('composer');
+    var search = document.getElementById('search');
+    var messageInput = document.getElementById('messageInput');
+    var sendButton = document.getElementById('sendButton');
+
+    function initials(value){
+      var words = String(value || 'IG').trim().split(/\\s+/).filter(Boolean);
+      return words.slice(0,2).map(function(word){return word.charAt(0)}).join('').toUpperCase() || 'IG';
+    }
+    function dateValue(value){
+      if(!value) return null;
+      var normalized = String(value).indexOf('T') >= 0 ? String(value) : String(value).replace(' ','T') + 'Z';
+      var date = new Date(normalized);
+      return isNaN(date.getTime()) ? null : date;
+    }
+    function formatListTime(value){
+      var date = dateValue(value); if(!date) return '';
+      var now = new Date();
+      if(date.toDateString() === now.toDateString()) return date.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
+      return date.toLocaleDateString([], {day:'2-digit',month:'short'});
+    }
+    function formatMessageTime(value){
+      var date = dateValue(value); if(!date) return '';
+      return date.toLocaleString([], {day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'});
+    }
+    function showStatus(text){
+      var box = document.getElementById('status'); box.textContent = text; box.style.display = 'block';
+      clearTimeout(showStatus.timer); showStatus.timer = setTimeout(function(){box.style.display='none'}, 3500);
+    }
+    async function api(url, options){
+      var response = await fetch(url, options || {});
+      var data = await response.json().catch(function(){return {ok:false,error:'Invalid server response'}});
+      if(!response.ok || !data.ok) throw new Error(data.error || 'Request failed');
+      return data;
+    }
+    async function loadChats(){
+      try{
+        var data = await api('/admin/api/chats');
+        chats = data.chats || [];
+        renderChats();
+      }catch(error){chatList.innerHTML='';var e=document.createElement('div');e.className='empty';e.textContent=error.message;chatList.appendChild(e)}
+    }
+    function renderChats(){
+      var term = search.value.trim().toLowerCase();
+      var filtered = chats.filter(function(chat){return String(chat.customer_name || '').toLowerCase().indexOf(term)>=0 || String(chat.phone || '').indexOf(term)>=0});
+      chatList.innerHTML='';
+      if(!filtered.length){var e=document.createElement('div');e.className='empty';e.textContent='No conversations found';chatList.appendChild(e);return}
+      filtered.forEach(function(chat){
+        var item=document.createElement('div');item.className='chat-item'+(chat.phone===selectedPhone?' active':'');item.onclick=function(){selectChat(chat)};
+        var avatar=document.createElement('div');avatar.className='avatar';avatar.textContent=initials(chat.customer_name);
+        var main=document.createElement('div');main.className='chat-main';
+        var name=document.createElement('div');name.className='chat-name';name.textContent=chat.customer_name || chat.phone;
+        var preview=document.createElement('div');preview.className='chat-preview';preview.textContent=(chat.last_direction==='out'?'You: ':'')+(chat.last_message || '');
+        main.appendChild(name);main.appendChild(preview);
+        var meta=document.createElement('div');var time=document.createElement('div');time.className='chat-time';time.textContent=formatListTime(chat.last_at);meta.appendChild(time);
+        if(chat.checkout_status){var badge=document.createElement('span');badge.className='badge';badge.textContent=chat.checkout_status;meta.appendChild(badge)}
+        item.appendChild(avatar);item.appendChild(main);item.appendChild(meta);chatList.appendChild(item);
+      });
+    }
+    async function selectChat(chat){
+      selectedPhone=String(chat.phone);selectedName=chat.customer_name || selectedPhone;app.classList.add('open-chat');
+      document.getElementById('headerName').textContent=selectedName;document.getElementById('headerPhone').textContent='+'+selectedPhone;document.getElementById('headerAvatar').textContent=initials(selectedName);
+      placeholder.style.display='none';messages.style.display='block';composer.style.display='flex';renderChats();await loadMessages(true);
+    }
+    async function loadMessages(scroll){
+      if(!selectedPhone || loadingMessages) return; loadingMessages=true;
+      try{
+        var data=await api('/admin/api/messages?phone='+encodeURIComponent(selectedPhone));
+        selectedName=data.customerName || selectedName;document.getElementById('headerName').textContent=selectedName;document.getElementById('headerAvatar').textContent=initials(selectedName);
+        messages.innerHTML='';(data.messages || []).forEach(function(message){
+          var row=document.createElement('div');row.className='row '+(message.direction==='out'?'out':'in');
+          var bubble=document.createElement('div');bubble.className='bubble';var body=document.createElement('div');
+          var raw=String(message.body || '');var imageMatch=raw.match(/^\[image:(https:\/\/[^\]]+)\]\s*/);
+          if(imageMatch){var image=document.createElement('img');image.src=imageMatch[1];image.alt='Product image';image.loading='lazy';image.style.cssText='display:block;max-width:100%;max-height:320px;border-radius:7px;margin-bottom:7px;object-fit:cover';bubble.appendChild(image);raw=raw.slice(imageMatch[0].length)}
+          body.textContent=raw;var time=document.createElement('span');time.className='msg-time';time.textContent=formatMessageTime(message.created_at)+(message.direction==='out'?'  Sent':'');bubble.appendChild(body);bubble.appendChild(time);row.appendChild(bubble);messages.appendChild(row);
+        });
+        if(scroll) messages.scrollTop=messages.scrollHeight;
+      }catch(error){showStatus(error.message)}finally{loadingMessages=false}
+    }
+    composer.addEventListener('submit',async function(event){
+      event.preventDefault();var body=messageInput.value.trim();if(!body || !selectedPhone) return;
+      sendButton.disabled=true;
+      try{await api('/admin/api/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone:selectedPhone,body:body})});messageInput.value='';await loadMessages(true);await loadChats();showStatus('Message sent')}
+      catch(error){showStatus(error.message)}finally{sendButton.disabled=false;messageInput.focus()}
+    });
+    messageInput.addEventListener('keydown',function(event){if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();composer.requestSubmit()}});
+    search.addEventListener('input',renderChats);
+    document.getElementById('back').onclick=function(){app.classList.remove('open-chat')};
+    loadChats();setInterval(function(){loadChats();if(selectedPhone) loadMessages(false)},5000);
+  </script>
+</body>
+</html>`;
 }
 
 async function saveConversation(
