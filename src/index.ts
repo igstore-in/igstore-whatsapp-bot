@@ -2131,30 +2131,52 @@ async function findShopifyOrder(
   orderNumber: string,
 ): Promise<ShopifyOrderRow | null> {
   const digits = orderNumber.replace(/\D/g, "");
+  if (!digits) return null;
+
+  // Match the Shopify order number in all common forms: 1234, #1234,
+  // IG1234, IG-1234 and "Order 1234". Prefer the same WhatsApp number,
+  // but do not reject an otherwise exact order when Shopify stored no phone
+  // or a different contact number. The status response never exposes address,
+  // email or the customer's saved phone number.
   const row = await env.DB.prepare(`
     SELECT order_id, order_number, order_name, phone, customer_name,
            financial_status, fulfillment_status, shipment_status, status_label,
            tracking_company, tracking_number, tracking_url, order_status_url,
            total_price, currency, line_items_summary, cancelled_at
     FROM shopify_orders
-    WHERE (order_number = ? OR REPLACE(REPLACE(order_name, '#', ''), 'IG', '') = ?)
-      AND substr(phone, -10) = substr(?, -10)
-    ORDER BY updated_at DESC
+    WHERE order_number = ?
+       OR REPLACE(
+            REPLACE(
+              REPLACE(
+                REPLACE(
+                  REPLACE(UPPER(order_name), 'ORDER', ''),
+                'IG', ''),
+              '#', ''),
+            '-', ''),
+          ' ', '') = ?
+    ORDER BY
+      CASE
+        WHEN substr(phone, -10) = substr(?, -10) THEN 0
+        WHEN phone = '' OR phone IS NULL THEN 1
+        ELSE 2
+      END,
+      updated_at DESC
     LIMIT 1
   `)
     .bind(digits, digits, phone)
     .first<ShopifyOrderRow>();
+
   return row ?? null;
 }
 
 function orderNotFoundMessage(language: Language, orderNumber: string): string {
   if (language === "hi") {
-    return `ऑर्डर #${orderNumber} इस WhatsApp नंबर से नहीं मिला। नंबर दोबारा check करें या *Support* लिखें।`;
+    return `ऑर्डर #${orderNumber} अभी tracking system में sync नहीं मिला। कृपया order number दोबारा check करें। फिर भी issue रहे तो *Support* लिखें या ${SUPPORT_PHONE} पर संपर्क करें।`;
   }
   if (language === "en") {
-    return `Order #${orderNumber} was not found for this WhatsApp number. Check the number or reply *Support*.`;
+    return `Order #${orderNumber} is not synced in the tracking system yet. Please recheck the order number. If it still does not appear, reply *Support* or contact ${SUPPORT_PHONE}.`;
   }
-  return `Order #${orderNumber} is WhatsApp number se nahi mila. Number check karein ya *Support* likhein.`;
+  return `Order #${orderNumber} abhi tracking system mein sync nahi mila. Order number dobara check karein. Phir bhi issue rahe to *Support* likhein ya ${SUPPORT_PHONE} par contact karein.`;
 }
 
 function formatOrderStatusMessage(language: Language, order: ShopifyOrderRow): string {
