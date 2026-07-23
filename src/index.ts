@@ -4456,7 +4456,7 @@ function adminInboxHtml(): string {
     .sidebar{border-right:1px solid #d8dde1;display:flex;flex-direction:column;min-width:0;min-height:0;background:#fff}
     .brand{height:68px;padding:12px 16px;background:#f0f2f5;display:flex;align-items:center;gap:12px;border-bottom:1px solid #d8dde1}
     .logo{width:42px;height:42px;border-radius:50%;background:#00a884;color:#fff;display:grid;place-items:center;font-weight:800}
-    .brand strong{display:block;font-size:17px}.brand small{color:#667781}
+    .brand strong{display:block;font-size:17px}.brand small{color:#667781}.sync-form{margin-left:auto}.sync-form button{border:0;border-radius:7px;background:#00a884;color:#fff;padding:8px 10px;font-weight:700;cursor:pointer}
     .search{padding:10px 12px;background:#fff;border-bottom:1px solid #eef0f2}.search input{width:100%;border:0;background:#f0f2f5;border-radius:9px;padding:11px 14px;outline:none;font-size:14px}
     .chat-list{overflow-y:auto;overscroll-behavior:contain;-webkit-overflow-scrolling:touch;min-height:0;flex:1}.empty{padding:30px 18px;text-align:center;color:#667781}
     .chat-item{padding:12px 14px;display:grid;grid-template-columns:48px 1fr auto;gap:11px;cursor:pointer;border-bottom:1px solid #f0f2f5}.chat-item:hover,.chat-item.active{background:#f0f2f5}
@@ -4473,7 +4473,7 @@ function adminInboxHtml(): string {
 <body>
   <div class="app" id="app">
     <aside class="sidebar">
-      <div class="brand"><div class="logo">IG</div><div><strong>IG Store Inbox</strong><small>WhatsApp conversations</small></div></div>
+      <div class="brand"><div class="logo">IG</div><div><strong>IG Store Inbox</strong><small>WhatsApp conversations</small></div><form class="sync-form" method="post" action="/admin/api/run-abandoned"><button type="submit">Sync 30d</button></form></div>
       <div class="search"><input id="search" placeholder="Search name or phone"></div>
       <div class="chat-list" id="chatList"><div class="empty">Loading conversationsâ€¦</div></div>
     </aside>
