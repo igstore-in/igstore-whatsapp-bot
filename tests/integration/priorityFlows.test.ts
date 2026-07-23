@@ -45,6 +45,7 @@ describe("priority WhatsApp flows", () => {
         status: "pending",
         due_at: Date.now(),
         attempts: 0,
+        created_at: Date.now(),
       },
       {
         templateName: "abandoned_checkout_offer",
@@ -62,6 +63,7 @@ describe("priority WhatsApp flows", () => {
       "Asha",
       "Custom Name Plate",
       "₹799.00",
+      "No discount",
       "https://igstore.in/checkouts/recover/example",
     ]);
   });
