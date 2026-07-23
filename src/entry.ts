@@ -1,5 +1,3 @@
-import handler from "./index";
-
 type WorkerHandler = {
   fetch: (request: Request, env: unknown, ctx: unknown) => Response | Promise<Response>;
   scheduled?: (controller: unknown, env: unknown, ctx: unknown) => unknown;
@@ -25,34 +23,60 @@ function windows1252Byte(character: string): number | null {
   return CP1252_REVERSE.get(codePoint) ?? null;
 }
 
-function decodeMojibakeOnce(value: string): string {
-  let output = "";
-  let sourceRun = "";
-  let bytes: number[] = [];
+function utf8SequenceLength(firstByte: number): number {
+  if (firstByte >= 0xc2 && firstByte <= 0xdf) return 2;
+  if (firstByte >= 0xe0 && firstByte <= 0xef) return 3;
+  if (firstByte >= 0xf0 && firstByte <= 0xf4) return 4;
+  return 0;
+}
 
-  const flush = (): void => {
-    if (!sourceRun) return;
-    try {
-      output += utf8Decoder.decode(Uint8Array.from(bytes));
-    } catch {
-      output += sourceRun;
-    }
-    sourceRun = "";
-    bytes = [];
-  };
-
-  for (const character of value) {
-    const byte = windows1252Byte(character);
-    if (byte === null) {
-      flush();
-      output += character;
-    } else {
-      sourceRun += character;
-      bytes.push(byte);
-    }
+function isValidUtf8Sequence(bytes: number[]): boolean {
+  if (bytes.length < 2) return false;
+  for (let index = 1; index < bytes.length; index += 1) {
+    if (bytes[index] < 0x80 || bytes[index] > 0xbf) return false;
   }
 
-  flush();
+  if (bytes[0] === 0xe0 && bytes[1] < 0xa0) return false;
+  if (bytes[0] === 0xed && bytes[1] > 0x9f) return false;
+  if (bytes[0] === 0xf0 && bytes[1] < 0x90) return false;
+  if (bytes[0] === 0xf4 && bytes[1] > 0x8f) return false;
+  return true;
+}
+
+function decodeMojibakeOnce(value: string): string {
+  const characters = Array.from(value);
+  const bytes = characters.map(windows1252Byte);
+  let output = "";
+
+  for (let index = 0; index < characters.length;) {
+    const firstByte = bytes[index];
+    if (firstByte === null) {
+      output += characters[index];
+      index += 1;
+      continue;
+    }
+
+    const sequenceLength = utf8SequenceLength(firstByte);
+    if (sequenceLength > 0 && index + sequenceLength <= characters.length) {
+      const sequence = bytes.slice(index, index + sequenceLength);
+      if (
+        sequence.every((byte): byte is number => byte !== null) &&
+        isValidUtf8Sequence(sequence)
+      ) {
+        try {
+          output += utf8Decoder.decode(Uint8Array.from(sequence));
+          index += sequenceLength;
+          continue;
+        } catch {
+          // Preserve the original character when decoding is not safe.
+        }
+      }
+    }
+
+    output += characters[index];
+    index += 1;
+  }
+
   return output;
 }
 
@@ -111,7 +135,24 @@ const repairedFetch: typeof fetch = async (input, init) => {
   return nativeFetch(input, nextInit);
 };
 
-(globalThis as unknown as { fetch: typeof fetch }).fetch = repairedFetch;
+try {
+  Object.defineProperty(globalThis, "fetch", {
+    configurable: true,
+    writable: true,
+    value: repairedFetch,
+  });
+} catch {
+  (globalThis as unknown as { fetch: typeof fetch }).fetch = repairedFetch;
+}
+
+let handlerPromise: Promise<WorkerHandler> | null = null;
+
+function loadHandler(): Promise<WorkerHandler> {
+  if (!handlerPromise) {
+    handlerPromise = import("./index").then((module) => module.default as WorkerHandler);
+  }
+  return handlerPromise;
+}
 
 async function repairWorkerResponse(response: Response): Promise<Response> {
   const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
@@ -136,13 +177,14 @@ async function repairWorkerResponse(response: Response): Promise<Response> {
   });
 }
 
-const originalHandler = handler as WorkerHandler;
-
 export default {
   async fetch(request: Request, env: unknown, ctx: unknown): Promise<Response> {
-    return repairWorkerResponse(await originalHandler.fetch(request, env, ctx));
+    const handler = await loadHandler();
+    return repairWorkerResponse(await handler.fetch(request, env, ctx));
   },
-  scheduled(controller: unknown, env: unknown, ctx: unknown): unknown {
-    return originalHandler.scheduled?.(controller, env, ctx);
+  scheduled(controller: unknown, env: unknown, ctx: unknown): void {
+    const executionContext = ctx as { waitUntil?: (promise: Promise<unknown>) => void };
+    const task = loadHandler().then((handler) => handler.scheduled?.(controller, env, ctx));
+    executionContext.waitUntil?.(task);
   },
 };
