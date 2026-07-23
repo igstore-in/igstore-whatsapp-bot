@@ -1,6 +1,6 @@
 {
   "compatibility_date": "2025-10-08",
-  "main": "src/entry.ts",
+  "main": "src/order-entry.ts",
   "name": "igstore-whatsapp-bot",
   "upload_source_maps": true,
   "observability": {
