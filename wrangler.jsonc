@@ -9,6 +9,10 @@
   "triggers": {
     "crons": ["*/15 * * * *"]
   },
+  "vars": {
+    "SHOPIFY_ADMIN_DOMAIN": "nnruh1-fa.myshopify.com",
+    "SHOPIFY_CLIENT_ID": "2b873ac6c1738dc7b8b99b236ab65569"
+  },
   "d1_databases": [
     {
       "binding": "DB",
@@ -17,3 +21,4 @@
     }
   ]
 }
+
