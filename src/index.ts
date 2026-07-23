@@ -4473,7 +4473,7 @@ function adminInboxHtml(): string {
 <body>
   <div class="app" id="app">
     <aside class="sidebar">
-      <div class="brand"><div class="logo">IG</div><div><strong>IG Store Inbox</strong><small>WhatsApp conversations</small></div><form class="sync-form" method="post" action="/admin/api/run-abandoned"><button type="submit">Sync 30d</button></form></div>
+      <div class="brand"><div class="logo">IG</div><div><strong>IG Store Inbox</strong><small>WhatsApp conversations</small></div><div class="sync-form"><button id="syncButton" type="button">Sync 30d</button></div></div>
       <div class="search"><input id="search" placeholder="Search name or phone"></div>
       <div class="chat-list" id="chatList"><div class="empty">Loading conversationsâ€¦</div></div>
     </aside>
@@ -4502,6 +4502,7 @@ function adminInboxHtml(): string {
     var search = document.getElementById('search');
     var messageInput = document.getElementById('messageInput');
     var sendButton = document.getElementById('sendButton');
+    var syncButton = document.getElementById('syncButton');
 
     function initials(value){
       var words = String(value || 'IG').trim().split(/\\s+/).filter(Boolean);
@@ -4585,6 +4586,16 @@ function adminInboxHtml(): string {
     });
     messageInput.addEventListener('keydown',function(event){if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();composer.requestSubmit()}});
     search.addEventListener('input',renderChats);
+    syncButton.addEventListener('click',async function(){
+      syncButton.disabled=true;
+      try{
+        var data=await api('/admin/api/run-abandoned',{method:'POST'});
+        var counts=data.counts||{};
+        showStatus('30-day sync complete Â· sent '+(counts.sent||0)+' Â· pending '+(counts.pending||0)+' Â· failed '+(counts.failed||0));
+        await loadChats();
+      }catch(error){showStatus(error.message)}
+      finally{syncButton.disabled=false}
+    });
     document.getElementById('back').onclick=function(){app.classList.remove('open-chat')};
     loadChats();setInterval(function(){loadChats();if(selectedPhone) loadMessages(false)},5000);
   </script>
