@@ -1,0 +1,73 @@
+{% doc %}
+Renders an unchecked, explicit WhatsApp cart-reminder consent field.
+Place this snippet inside the cart form before the checkout button.
+
+@example
+{% render 'ig-whatsapp-consent' %}
+{% enddoc %}
+
+<div class="ig-whatsapp-consent" data-ig-whatsapp-consent>
+  <label>
+    <input
+      type="checkbox"
+      name="attributes[WhatsApp Opt In]"
+      value="Yes"
+      data-ig-whatsapp-consent-checkbox
+    >
+    Send my cart reminder and order updates on WhatsApp. Reply STOP anytime.
+  </label>
+  <input
+    type="hidden"
+    value="cart_checkbox"
+    data-ig-whatsapp-consent-source
+    disabled
+  >
+  <input
+    type="hidden"
+    value=""
+    data-ig-whatsapp-consent-time
+    disabled
+  >
+</div>
+
+{% stylesheet %}
+  .ig-whatsapp-consent {
+    margin-block: 1rem;
+    font-size: 0.95rem;
+    line-height: 1.5;
+  }
+
+  .ig-whatsapp-consent label {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.625rem;
+    cursor: pointer;
+  }
+
+  .ig-whatsapp-consent input[type='checkbox'] {
+    inline-size: 1.125rem;
+    block-size: 1.125rem;
+    margin-block-start: 0.125rem;
+    flex: 0 0 auto;
+  }
+{% endstylesheet %}
+
+{% javascript %}
+  document.querySelectorAll('[data-ig-whatsapp-consent]').forEach((container) => {
+    const checkbox = container.querySelector('[data-ig-whatsapp-consent-checkbox]');
+    const source = container.querySelector('[data-ig-whatsapp-consent-source]');
+    const time = container.querySelector('[data-ig-whatsapp-consent-time]');
+    if (!checkbox || !source || !time) return;
+
+    const update = () => {
+      source.disabled = !checkbox.checked;
+      time.disabled = !checkbox.checked;
+      source.name = checkbox.checked ? 'attributes[WhatsApp Opt In Source]' : '';
+      time.name = checkbox.checked ? 'attributes[WhatsApp Opt In At]' : '';
+      time.value = checkbox.checked ? new Date().toISOString() : '';
+    };
+
+    checkbox.addEventListener('change', update);
+    update();
+  });
+{% endjavascript %}
