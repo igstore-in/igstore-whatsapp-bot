@@ -1,4 +1,5 @@
 import baseHandler from "./order-entry";
+import { marketingCommand } from "./production-automation";
 
 type BotEnv = {
   DB: any;
@@ -107,20 +108,8 @@ async function verifyMetaSignature(
   return difference === 0;
 }
 
-async function ensureColumns(env: BotEnv): Promise<void> {
-  for (const sql of [
-    "ALTER TABLE order_flow_context ADD COLUMN mobile_phone TEXT NOT NULL DEFAULT ''",
-    "ALTER TABLE whatsapp_order_drafts ADD COLUMN mobile_phone TEXT NOT NULL DEFAULT ''",
-  ]) {
-    try {
-      await env.DB.prepare(sql).run();
-    } catch (error) {
-      const message = String(error).toLowerCase();
-      if (!message.includes("duplicate column") && !message.includes("already exists")) {
-        console.error("Variant order migration failed", String(error));
-      }
-    }
-  }
+async function ensureColumns(_env: BotEnv): Promise<void> {
+  return;
 }
 
 async function claimMessage(env: BotEnv, messageId: string): Promise<boolean> {
@@ -172,7 +161,7 @@ async function getSuggestions(env: BotEnv, phone: string): Promise<Product[]> {
     SELECT products_json FROM last_product_suggestions
     WHERE phone = ? AND datetime(updated_at) >= datetime('now', '-24 hours')
     LIMIT 1
-  `).bind(phone).first<{ products_json: string }>();
+  `).bind(phone).first() as { products_json: string } | null;
   if (!row?.products_json) return [];
   try {
     const products = JSON.parse(row.products_json);
@@ -187,7 +176,7 @@ async function recentOptionPrompt(env: BotEnv, phone: string): Promise<boolean> 
     SELECT body FROM conversations
     WHERE phone = ? AND direction = 'out'
     ORDER BY id DESC LIMIT 1
-  `).bind(phone).first<{ body: string }>();
+  `).bind(phone).first() as { body: string } | null;
   return /option|design|pasand|which product|kaunsa product|कौन-सा/i.test(String(row?.body ?? ""));
 }
 
@@ -287,7 +276,7 @@ async function getContext(env: BotEnv, phone: string): Promise<VariantOrderConte
     FROM order_flow_context
     WHERE phone = ? AND step LIKE 'vx_%'
     LIMIT 1
-  `).bind(phone).first<any>();
+  `).bind(phone).first() as any;
   if (!row) return null;
   try {
     return {
@@ -618,9 +607,84 @@ async function maybeHandleVariants(request: Request, env: BotEnv): Promise<Respo
   }
   const message = extractMessage(payload);
   if (!message) return null;
+  const marketingResponse = await handleGlobalMarketingCommand(env, message);
+  if (marketingResponse) return marketingResponse;
+  const now = Date.now();
+  await env.DB.prepare(`
+    UPDATE abandoned_checkouts
+    SET status = 'engaged', engaged_at = ?, paused_until = ?, updated_at = ?
+    WHERE substr(phone, -10) = substr(?, -10)
+      AND status IN ('pending', 'failed')
+  `).bind(now, now + 24 * 60 * 60_000, now, message.phone).run();
   const context = await getContext(env, message.phone);
   if (context) return continueVariantFlow(env, context, message);
   return startVariantFlow(env, message);
+}
+
+async function handleGlobalMarketingCommand(
+  env: BotEnv,
+  message: { id: string; phone: string; text: string },
+): Promise<Response | null> {
+  const command = marketingCommand(message.text);
+  if (!command) return null;
+  if (!(await claimMessage(env, message.id))) {
+    return new Response("EVENT_RECEIVED", { status: 200 });
+  }
+
+  await saveConversation(env, message.phone, "in", message.text, message.id || null);
+  const now = Date.now();
+  if (command === "stop") {
+    const existing = await env.DB.prepare(`
+      SELECT phone FROM whatsapp_marketing_opt_outs
+      WHERE substr(phone, -10) = substr(?, -10)
+      LIMIT 1
+    `).bind(message.phone).first();
+    await env.DB.prepare(`
+      INSERT OR IGNORE INTO whatsapp_marketing_opt_outs (phone, opted_out_at)
+      VALUES (?, CURRENT_TIMESTAMP)
+    `).bind(message.phone).run();
+    await env.DB.prepare(`
+      UPDATE abandoned_checkouts
+      SET status = 'stopped', skip_reason = 'customer_opted_out', updated_at = ?
+      WHERE substr(phone, -10) = substr(?, -10)
+        AND status IN ('pending', 'failed', 'engaged')
+    `).bind(now, message.phone).run();
+    await env.DB.prepare(`
+      UPDATE marketing_contacts
+      SET opted_in = 0, updated_at = CURRENT_TIMESTAMP
+      WHERE substr(phone, -10) = substr(?, -10)
+    `).bind(message.phone).run();
+    await env.DB.prepare("DELETE FROM order_flow_context WHERE phone = ?")
+      .bind(message.phone)
+      .run();
+    if (!existing) {
+      await sendText(
+        env,
+        message.phone,
+        "ठीक है ✅ IG Store के promotional और cart reminder WhatsApp messages बंद कर दिए गए हैं।\n\nOrder support के लिए आप कभी भी यहाँ message कर सकते हैं।\nदोबारा offers शुरू करने के लिए START लिखें।",
+      );
+    }
+  } else {
+    await env.DB.prepare(
+      "DELETE FROM whatsapp_marketing_opt_outs WHERE substr(phone, -10) = substr(?, -10)",
+    ).bind(message.phone).run();
+    await env.DB.prepare(`
+      INSERT INTO whatsapp_marketing_consents (
+        phone, consented_at, source, created_at, updated_at
+      ) VALUES (?, ?, 'whatsapp_inbound_start', ?, ?)
+      ON CONFLICT(phone) DO UPDATE SET
+        consented_at = excluded.consented_at,
+        source = excluded.source,
+        updated_at = excluded.updated_at
+    `).bind(message.phone, now, now, now).run();
+    await sendText(
+      env,
+      message.phone,
+      "WhatsApp offers और cart reminders फिर से शुरू हो गए हैं ✅\nआप कभी भी STOP लिखकर इन्हें बंद कर सकते हैं।",
+    );
+  }
+
+  return new Response("EVENT_RECEIVED", { status: 200 });
 }
 
 export default {
