@@ -7,11 +7,21 @@
     "enabled": true
   },
   "triggers": {
-    "crons": ["*/15 * * * *"]
+    "crons": [
+      "* * * * *",
+      "*/5 * * * *",
+      "0 */6 * * *"
+    ]
   },
   "vars": {
     "SHOPIFY_ADMIN_DOMAIN": "nnruh1-fa.myshopify.com",
-    "SHOPIFY_CLIENT_ID": "2b873ac6c1738dc7b8b99b236ab65569"
+    "SHOPIFY_CLIENT_ID": "2b873ac6c1738dc7b8b99b236ab65569",
+    "ABANDONED_TEMPLATE_FIRST": "ig_abandoned_cart_1",
+    "ABANDONED_TEMPLATE_SECOND": "ig_abandoned_cart_5",
+    "ABANDONED_TEMPLATE_THIRD": "ig_abandoned_cart_10",
+    "ABANDONED_TEMPLATE_LANGUAGE": "en_US",
+    "ABANDONED_OFFER_CODE": "CART5",
+    "ABANDONED_FINAL_OFFER_CODE": "CART10"
   },
   "d1_databases": [
     {

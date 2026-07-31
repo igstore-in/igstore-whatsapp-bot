@@ -118,22 +118,8 @@ async function verifyMetaSignature(
   return difference === 0;
 }
 
-async function ensureMobileColumns(env: BotEnv): Promise<void> {
-  const statements = [
-    "ALTER TABLE order_flow_context ADD COLUMN mobile_phone TEXT NOT NULL DEFAULT ''",
-    "ALTER TABLE whatsapp_order_drafts ADD COLUMN mobile_phone TEXT NOT NULL DEFAULT ''",
-  ];
-
-  for (const statement of statements) {
-    try {
-      await env.DB.prepare(statement).run();
-    } catch (error) {
-      const message = String(error).toLowerCase();
-      if (!message.includes("duplicate column") && !message.includes("already exists")) {
-        console.error("Mobile column migration failed", String(error));
-      }
-    }
-  }
+async function ensureMobileColumns(_env: BotEnv): Promise<void> {
+  return;
 }
 
 async function getOrderContext(env: BotEnv, phone: string): Promise<StoredOrderContext | null> {
@@ -145,7 +131,7 @@ async function getOrderContext(env: BotEnv, phone: string): Promise<StoredOrderC
     FROM order_flow_context
     WHERE phone = ? AND step IN ('wa_name', 'wa_mobile', 'wa_confirm')
     LIMIT 1
-  `).bind(phone).first<any>();
+  `).bind(phone).first() as any;
 
   if (!row) return null;
   try {

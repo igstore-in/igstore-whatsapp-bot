@@ -17,7 +17,7 @@ describe("priority WhatsApp flows", () => {
     expect(extractOrderNumber(input)).toBe(expected);
   });
 
-  it("keeps unrelated product numbers out of tracking", () => {
+  it("keeps unrelated text out of tracking", () => {
     expect(extractOrderNumber("budget 499")).toBe("499");
     expect(extractOrderNumber("hello")).toBeNull();
   });
@@ -30,7 +30,7 @@ describe("priority WhatsApp flows", () => {
     expect(requiresHumanSupport("show birthday gifts")).toBe(false);
   });
 
-  it("builds the approved abandoned-checkout template payload", () => {
+  it("builds the approved Stage 1 template payload", () => {
     const payload = buildAbandonedTemplatePayload(
       {
         checkout_token: "checkout-1",
@@ -48,14 +48,16 @@ describe("priority WhatsApp flows", () => {
         created_at: Date.now(),
       },
       {
-        templateName: "abandoned_checkout_offer",
+        templateName: "ig_abandoned_cart_1",
         language: "en_US",
         fallbackImage: "https://cdn.example.com/fallback.jpg",
+        stage: 1,
+        urlSuffix: "checkouts/recover/example",
       },
     ) as any;
 
     expect(payload.to).toBe("919876543210");
-    expect(payload.template.name).toBe("abandoned_checkout_offer");
+    expect(payload.template.name).toBe("ig_abandoned_cart_1");
     expect(payload.template.components[0].parameters[0].image.link).toContain(
       "name-plate.jpg",
     );
@@ -63,9 +65,12 @@ describe("priority WhatsApp flows", () => {
       "Asha",
       "Custom Name Plate",
       "₹799.00",
-      "No discount",
-      "https://igstore.in/checkouts/recover/example",
     ]);
+    expect(payload.template.components[2]).toEqual({
+      type: "button",
+      sub_type: "url",
+      index: "0",
+      parameters: [{ type: "text", text: "checkouts/recover/example" }],
+    });
   });
 });
-
