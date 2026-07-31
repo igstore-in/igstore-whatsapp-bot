@@ -23,13 +23,13 @@ Body variables:
 ```text
 Hi {{1}} 👋
 
-Aapka {{2}} IG Store cart mein reh gaya hai.
+Your {{2}} is still waiting in your IG Store cart.
 Cart total: {{3}}
 
-Abhi order complete kar sakte hain 👇
-Koi help chahiye to isi WhatsApp par reply karein.
+Complete your order now 👇
+Need help? Reply to this WhatsApp message.
 
-Promotional reminders band karne ke liye STOP likhein.
+Reply STOP to stop promotional reminders.
 ```
 
 Buttons:
@@ -51,14 +51,14 @@ Body variables:
 ```text
 Hi {{1}} 😊
 
-Aapka {{2}} abhi bhi cart mein saved hai.
+Your {{2}} is still saved in your cart.
 Cart total: {{3}}
 
-Aaj order complete karne par 5% OFF milega.
+Complete your order today and get 5% OFF.
 Code: {{4}}
 
-Offer availability checkout par verify hogi.
-Reminders band karne ke liye STOP likhein.
+Offer availability will be verified at checkout.
+Reply STOP to stop reminders.
 ```
 
 Dynamic URL button: `Get 5% OFF`
@@ -75,14 +75,14 @@ Body variables:
 ```text
 Hi {{1}} 🎁
 
-Aapke {{2}} order ke liye final reminder hai.
+This is the final reminder for your {{2}} order.
 Cart total: {{3}}
 
-Ab 10% OFF ke saath order complete karein.
+Complete your order now with 10% OFF.
 Code: {{4}}
 
-Yeh is cart ka last automated reminder hai.
-Messages band karne ke liye STOP likhein.
+This is the last automated reminder for this cart.
+Reply STOP to stop messages.
 ```
 
 Dynamic URL button: `Get 10% OFF`
