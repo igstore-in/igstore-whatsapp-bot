@@ -52,7 +52,7 @@ const CP1252_REVERSE = new Map<number, number>([
 ]);
 
 const MOJIBAKE_MARKER = /(?:Ã|Â|â|ð|à¤|à¥|à¦|à§|à¨|à©|àª|à«|à¬|à­|à®|à¯|à°|à±|à²|à³|à´|àµ)/;
-const utf8Decoder = new TextDecoder("utf-8", { fatal: true });
+const utf8Decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false });
 const nativeFetch = globalThis.fetch.bind(globalThis);
 
 function windows1252Byte(character: string): number | null {
@@ -408,7 +408,7 @@ async function getManualContext(env: BotEnv, phone: string): Promise<ManualOrder
     FROM order_flow_context
     WHERE phone = ? AND step LIKE 'wa_%'
     LIMIT 1
-  `).bind(phone).first<any>();
+  `).bind(phone).first() as any;
   if (!row) return null;
   try {
     return {
@@ -469,7 +469,7 @@ async function getProductSuggestions(env: BotEnv, phone: string): Promise<OrderP
     FROM last_product_suggestions
     WHERE phone = ? AND datetime(updated_at) >= datetime('now', '-24 hours')
     LIMIT 1
-  `).bind(phone).first<{ products_json: string }>();
+  `).bind(phone).first() as { products_json: string } | null;
   if (!row?.products_json) return [];
   try {
     const products = JSON.parse(row.products_json);
@@ -501,7 +501,7 @@ async function recentMessageAskedForProductOption(env: BotEnv, phone: string): P
     SELECT body FROM conversations
     WHERE phone = ? AND direction = 'out'
     ORDER BY id DESC LIMIT 1
-  `).bind(phone).first<{ body: string }>();
+  `).bind(phone).first() as { body: string } | null;
   const body = repairMojibake(String(row?.body ?? "")).toLowerCase();
   return /option|design|pasand|which product|kaunsa product|कौन-सा/.test(body);
 }
