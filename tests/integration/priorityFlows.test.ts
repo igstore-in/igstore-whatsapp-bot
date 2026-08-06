@@ -1,10 +1,14 @@
 import { describe, expect, it } from "vitest";
 import {
+  allOrderVariants,
   buildAbandonedTemplatePayload,
+  canonicalOrderStep,
   extractOrderNumber,
   isAngryMessage,
+  parseIndianMobile,
   requiresHumanSupport,
 } from "../../src/index";
+import { repairMojibake } from "../../src/entry";
 
 describe("priority WhatsApp flows", () => {
   it.each([
@@ -28,6 +32,42 @@ describe("priority WhatsApp flows", () => {
     expect(requiresHumanSupport("bulk order quotation")).toBe(true);
     expect(isAngryMessage("this is a fraud, consumer court complaint")).toBe(true);
     expect(requiresHumanSupport("show birthday gifts")).toBe(false);
+  });
+
+  it("accepts Indian mobile numbers and rejects invalid customer numbers", () => {
+    expect(parseIndianMobile("+91 95876 66693")).toBe("9587666693");
+    expect(parseIndianMobile("9587666693")).toBe("9587666693");
+    expect(parseIndianMobile("5587666693")).toBeNull();
+    expect(parseIndianMobile("958766669")).toBeNull();
+  });
+
+  it("resumes legacy wrapper contexts in the consolidated order flow", () => {
+    expect(canonicalOrderStep("wa_mobile")).toBe("mobile");
+    expect(canonicalOrderStep("vx_confirm")).toBe("confirm");
+    expect(canonicalOrderStep("quantity")).toBe("quantity");
+  });
+
+  it("keeps unavailable variants selectable and creates a manual fallback", () => {
+    const unavailable = allOrderVariants({
+      title: "Name Plate",
+      url: "/products/name-plate",
+      variants: [{ id: "123", title: "18 Inch", price: 399, available: false }],
+    });
+    expect(unavailable).toHaveLength(1);
+    expect(unavailable[0]).toMatchObject({ id: "123", available: false });
+
+    const fallback = allOrderVariants({
+      title: "Custom Gift",
+      url: "/products/custom-gift",
+      price: 299,
+    });
+    expect(fallback[0]).toMatchObject({ title: "Team confirmation", available: false });
+  });
+
+  it("repairs outgoing Hindi, rupee and emoji mojibake without damaging plain text", () => {
+    expect(repairMojibake("â‚¹229")).toBe("₹229");
+    expect(repairMojibake("ðŸ“¦ Order")).toBe("📦 Order");
+    expect(repairMojibake("Plain order text")).toBe("Plain order text");
   });
 
   it("builds the approved abandoned-checkout template payload", () => {
@@ -69,3 +109,4 @@ describe("priority WhatsApp flows", () => {
   });
 });
 
+
