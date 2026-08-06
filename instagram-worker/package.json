@@ -1,0 +1,17 @@
+{
+  "name": "igstore-instagram-comment-bot",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "tsc --noEmit",
+    "test": "vitest run",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "5.20260804.1",
+    "typescript": "5.9.2",
+    "vitest": "4.1.10",
+    "wrangler": "4.119.0"
+  }
+}
