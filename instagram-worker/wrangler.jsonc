@@ -10,7 +10,8 @@
   },
   "vars": {
     "META_GRAPH_VERSION": "v25.0",
-    "META_GRAPH_HOST": "https://graph.facebook.com"
+    "META_GRAPH_HOST": "https://graph.instagram.com",
+    "IG_USER_ID": "17841473462461262"
   },
   "d1_databases": [
     {
