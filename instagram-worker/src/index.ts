@@ -160,7 +160,7 @@ async function graphPost(
   path: string,
   body: unknown
 ): Promise<{ id?: string }> {
-  const host = (env.META_GRAPH_HOST || "https://graph.facebook.com").replace(/\/$/, "");
+  const host = (env.META_GRAPH_HOST || "https://graph.instagram.com").replace(/\/$/, "");
   const version = env.META_GRAPH_VERSION || "v25.0";
   const response = await fetch(`${host}/${version}/${path}`, {
     method: "POST",
