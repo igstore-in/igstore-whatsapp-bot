@@ -5,9 +5,36 @@
   "compatibility_date": "2026-08-01",
   "workers_dev": true,
   "observability": {
-    "enabled": true
+    "enabled": true,
+    "head_sampling_rate": 1
   },
   "vars": {
-    "META_GRAPH_VERSION": "v23.0"
+    "META_GRAPH_VERSION": "v25.0",
+    "META_GRAPH_HOST": "https://graph.facebook.com"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "igstore-instagram-events",
+      "database_id": "2a165e39-86f8-4e50-aa94-823ad98cc737"
+    }
+  ],
+  "queues": {
+    "producers": [
+      {
+        "binding": "COMMENT_QUEUE",
+        "queue": "igstore-instagram-comments"
+      }
+    ],
+    "consumers": [
+      {
+        "queue": "igstore-instagram-comments",
+        "max_batch_size": 1,
+        "max_batch_timeout": 2,
+        "max_retries": 5,
+        "retry_delay": 30,
+        "dead_letter_queue": "igstore-instagram-comments-dlq"
+      }
+    ]
   }
 }
