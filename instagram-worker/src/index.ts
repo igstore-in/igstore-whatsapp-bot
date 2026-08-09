@@ -69,6 +69,12 @@ type ReelMetadata = {
   permalink: string | null;
 };
 
+type StoredButton = {
+  media_id: string;
+  button_label: string;
+  button_url: string;
+};
+
 type ActivityRow = {
   event_id: string;
   media_id: string;
@@ -267,13 +273,14 @@ function ruleToConfig(rule: StoredRule): ReelConfig {
   };
 }
 
-type ResolvedConfig = { config: ReelConfig | undefined; isDefault: boolean };
+type ResolvedConfig = { config: ReelConfig | undefined; isDefault: boolean; button?: StoredButton };
 
 async function configForEvent(env: Env, mediaId: string): Promise<ResolvedConfig> {
+  await ensureReelButtonsTable(env);
   const exact = await env.DB.prepare(
     "SELECT media_id, enabled, keywords_json, public_reply, private_reply, updated_at FROM reel_rules WHERE media_id = ?"
   ).bind(mediaId).first<StoredRule>();
-  if (exact) return { config: ruleToConfig(exact), isDefault: false };
+  if (exact) return { config: ruleToConfig(exact), isDefault: false, button: (await env.DB.prepare("SELECT media_id, button_label, button_url FROM reel_buttons WHERE media_id = ?").bind(mediaId).first<StoredButton>()) ?? undefined };
   const fallback = await env.DB.prepare(
     "SELECT media_id, enabled, keywords_json, public_reply, private_reply, updated_at FROM reel_rules WHERE media_id = 'default'"
   ).first<StoredRule>();
@@ -283,6 +290,12 @@ async function configForEvent(env: Env, mediaId: string): Promise<ResolvedConfig
 async function ensureReelMetadataTable(env: Env): Promise<void> {
   await env.DB.exec(
     "CREATE TABLE IF NOT EXISTS reel_metadata (media_id TEXT PRIMARY KEY, shortcode TEXT, permalink TEXT, updated_at INTEGER NOT NULL)"
+  );
+}
+
+async function ensureReelButtonsTable(env: Env): Promise<void> {
+  await env.DB.exec(
+    "CREATE TABLE IF NOT EXISTS reel_buttons (media_id TEXT PRIMARY KEY, button_label TEXT NOT NULL, button_url TEXT NOT NULL, updated_at INTEGER NOT NULL)"
   );
 }
 
@@ -327,9 +340,9 @@ async function recordActivity(env: Env, event: CommentEvent, status: string, rep
   ).bind(event.eventId, event.commentId, event.mediaId, event.username || null, event.text || null, replies?.publicReply ?? null, replies?.privateReply ?? null, status, error?.slice(0, 500) ?? null, event.receivedAt, now).run();
 }
 
-function publicRule(rule: StoredRule, metadata?: ReelMetadata): Record<string, unknown> {
+function publicRule(rule: StoredRule, metadata?: ReelMetadata, button?: StoredButton): Record<string, unknown> {
   const config = ruleToConfig(rule);
-  return { mediaId: rule.media_id, shortcode: metadata?.shortcode ?? null, permalink: metadata?.permalink ?? null, ...config, updatedAt: rule.updated_at };
+  return { mediaId: rule.media_id, shortcode: metadata?.shortcode ?? null, permalink: metadata?.permalink ?? null, buttonLabel: button?.button_label ?? "", buttonUrl: button?.button_url ?? "", ...config, updatedAt: rule.updated_at };
 }
 
 async function parseJson(request: Request): Promise<Record<string, unknown> | undefined> {
@@ -341,14 +354,27 @@ async function parseJson(request: Request): Promise<Record<string, unknown> | un
   }
 }
 
-function validateRule(value: Record<string, unknown>): { rule?: Omit<StoredRule, "media_id" | "updated_at">; error?: string } {
+function validateRule(value: Record<string, unknown>): { rule?: Omit<StoredRule, "media_id" | "updated_at">; button?: { label: string; url: string }; error?: string } {
   const enabled = value.enabled === true;
   const keywords = Array.isArray(value.keywords) ? value.keywords.filter((item): item is string => typeof item === "string").map((item) => item.trim()).filter(Boolean).slice(0, 30) : [];
   const publicReply = typeof value.publicReply === "string" ? value.publicReply.trim() : "";
   const privateReply = typeof value.privateReply === "string" ? value.privateReply.trim() : "";
+  const buttonLabel = typeof value.buttonLabel === "string" ? value.buttonLabel.trim() : "";
+  const buttonUrl = typeof value.buttonUrl === "string" ? value.buttonUrl.trim() : "";
   if (!publicReply || !privateReply) return { error: "Public reply and private DM reply are required." };
   if (publicReply.length > 1000 || privateReply.length > 1000) return { error: "Each reply must be 1,000 characters or fewer." };
-  return { rule: { enabled: enabled ? 1 : 0, keywords_json: JSON.stringify(keywords), public_reply: publicReply, private_reply: privateReply } };
+  if ((buttonLabel && !buttonUrl) || (!buttonLabel && buttonUrl)) return { error: "Enter both button text and button link, or leave both blank." };
+  if (buttonLabel.length > 20) return { error: "Button text must be 20 characters or fewer." };
+  if (buttonUrl) {
+    try {
+      const url = new URL(buttonUrl);
+      if (!["https:", "http:"].includes(url.protocol)) throw new Error();
+    } catch {
+      return { error: "Button link must be a valid http or https URL." };
+    }
+    if (/https?:\/\//i.test(privateReply)) return { error: "Remove the direct link from Private DM reply and use Button link instead." };
+  }
+  return { rule: { enabled: enabled ? 1 : 0, keywords_json: JSON.stringify(keywords), public_reply: publicReply, private_reply: privateReply }, button: buttonUrl ? { label: buttonLabel, url: buttonUrl } : undefined };
 }
 
 function shortcodeFromInput(value: string): string | undefined {
@@ -409,6 +435,7 @@ async function handleAdmin(request: Request, env: Env, url: URL): Promise<Respon
   }
   if (!(await isAdmin(request, env))) return json({ error: "Unauthorized" }, 401);
   await ensureReelMetadataTable(env);
+  await ensureReelButtonsTable(env);
   await ensureActivityTable(env);
   if (url.pathname === "/api/admin/overview" && request.method === "GET") {
     const rows = await env.DB.prepare(
@@ -421,8 +448,10 @@ async function handleAdmin(request: Request, env: Env, url: URL): Promise<Respon
       "SELECT media_id, enabled, keywords_json, public_reply, private_reply, updated_at FROM reel_rules ORDER BY CASE WHEN media_id = 'default' THEN 0 ELSE 1 END, updated_at DESC"
     ).all<StoredRule>();
     const metadata = await env.DB.prepare("SELECT media_id, shortcode, permalink FROM reel_metadata").all<ReelMetadata>();
+    const buttons = await env.DB.prepare("SELECT media_id, button_label, button_url FROM reel_buttons").all<StoredButton>();
     const metadataByMediaId = new Map(metadata.results.map((item) => [item.media_id, item]));
-    return json({ rules: results.map((rule) => publicRule(rule, metadataByMediaId.get(rule.media_id))) });
+    const buttonsByMediaId = new Map(buttons.results.map((item) => [item.media_id, item]));
+    return json({ rules: results.map((rule) => publicRule(rule, metadataByMediaId.get(rule.media_id), buttonsByMediaId.get(rule.media_id))) });
   }
   if (url.pathname === "/api/admin/activity" && request.method === "GET") {
     const limit = Math.min(100, Math.max(1, Number.parseInt(url.searchParams.get("limit") ?? "50", 10) || 50));
@@ -459,12 +488,20 @@ async function handleAdmin(request: Request, env: Env, url: URL): Promise<Respon
           "INSERT INTO reel_metadata (media_id, shortcode, permalink, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(media_id) DO UPDATE SET shortcode = excluded.shortcode, permalink = excluded.permalink, updated_at = excluded.updated_at"
         ).bind(reel.mediaId, reel.shortcode ?? null, reel.permalink ?? null, now).run();
       }
+      if (validated.button) {
+        await env.DB.prepare(
+          "INSERT INTO reel_buttons (media_id, button_label, button_url, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(media_id) DO UPDATE SET button_label = excluded.button_label, button_url = excluded.button_url, updated_at = excluded.updated_at"
+        ).bind(reel.mediaId, validated.button.label, validated.button.url, now).run();
+      } else {
+        await env.DB.prepare("DELETE FROM reel_buttons WHERE media_id = ?").bind(reel.mediaId).run();
+      }
       return json({ ok: true, mediaId: reel.mediaId, permalink: reel.permalink ?? null });
     }
     if (request.method === "DELETE") {
       const mediaId = reelInput;
       await env.DB.prepare("DELETE FROM reel_rules WHERE media_id = ?").bind(mediaId).run();
       await env.DB.prepare("DELETE FROM reel_metadata WHERE media_id = ?").bind(mediaId).run();
+      await env.DB.prepare("DELETE FROM reel_buttons WHERE media_id = ?").bind(mediaId).run();
       return json({ ok: true });
     }
   }
@@ -686,6 +723,8 @@ async function processEvent(env: Env, event: CommentEvent): Promise<void> {
       recipient: { comment_id: event.commentId },
       message: useAccessFlow
         ? buttonTemplate(privateReply, [{ type: "postback", title: "Send me the access", payload: "IGSTORE_ACCESS" }])
+        : resolved.button
+          ? buttonTemplate(privateReply, [{ type: "web_url", title: resolved.button.button_label, url: resolved.button.button_url }])
         : { text: privateReply }
     })
   );
