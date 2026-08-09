@@ -26,6 +26,12 @@ export type CommentEvent = {
   receivedAt: number;
 };
 
+type QuickReplyEvent = {
+  eventId: string;
+  senderId: string;
+  payload: string;
+};
+
 type MetaError = {
   message?: string;
   type?: string;
@@ -207,6 +213,26 @@ export function extractCommentEvents(payload: unknown): CommentEvent[] {
         parentId: String(value.parent_id ?? ""),
         receivedAt: Number(entry.time ?? Math.floor(Date.now() / 1000))
       });
+    }
+  }
+  return events;
+}
+
+function extractQuickReplyEvents(payload: unknown): QuickReplyEvent[] {
+  const source = payload as { object?: string; entry?: unknown[] };
+  if (source?.object && source.object !== "instagram") return [];
+  const events: QuickReplyEvent[] = [];
+  for (const rawEntry of source?.entry ?? []) {
+    const entry = rawEntry as { messaging?: unknown[] };
+    for (const rawMessage of entry.messaging ?? []) {
+      const message = rawMessage as {
+        sender?: { id?: unknown };
+        message?: { mid?: unknown; quick_reply?: { payload?: unknown } };
+      };
+      const eventId = String(message.message?.mid ?? "");
+      const senderId = String(message.sender?.id ?? "");
+      const replyPayload = String(message.message?.quick_reply?.payload ?? "");
+      if (eventId && senderId && replyPayload) events.push({ eventId, senderId, payload: replyPayload });
     }
   }
   return events;
@@ -480,6 +506,64 @@ async function graphPost(
   return { id: result.id };
 }
 
+type QuickReply = { content_type: "text"; title: string; payload: string };
+
+async function sendDirectMessage(
+  env: Env,
+  recipientId: string,
+  messageText: string,
+  quickReplies?: QuickReply[]
+): Promise<void> {
+  const ownerId = env.IG_USER_ID;
+  if (!ownerId) throw new Error("Instagram account ID is not configured.");
+  await graphPost(env, `${ownerId}/messages`, {
+    recipient: { id: recipientId },
+    message: { text: messageText, ...(quickReplies?.length ? { quick_replies: quickReplies } : {}) }
+  });
+}
+
+async function handleQuickReply(env: Env, event: QuickReplyEvent): Promise<void> {
+  if (event.payload === "IGSTORE_ACCESS") {
+    await sendDirectMessage(
+      env,
+      event.senderId,
+      "Before I send the store access, please follow @igstore_in. Then tap the confirmation below.",
+      [{ content_type: "text", title: "I'm following", payload: "IGSTORE_FOLLOW_CONFIRMED" }]
+    );
+    return;
+  }
+  if (event.payload === "IGSTORE_FOLLOW_CONFIRMED") {
+    await sendDirectMessage(
+      env,
+      event.senderId,
+      "Thank you! Here is your IGStore.in access link: https://igstore.in/"
+    );
+  }
+}
+
+async function processQuickReply(env: Env, event: QuickReplyEvent): Promise<void> {
+  await env.DB.exec(
+    "CREATE TABLE IF NOT EXISTS quick_reply_events (event_id TEXT PRIMARY KEY, status TEXT NOT NULL, updated_at INTEGER NOT NULL)"
+  );
+  const now = Math.floor(Date.now() / 1000);
+  await env.DB.prepare(
+    "INSERT OR IGNORE INTO quick_reply_events (event_id, status, updated_at) VALUES (?, 'received', ?)"
+  ).bind(event.eventId, now).run();
+  const claim = await env.DB.prepare(
+    "UPDATE quick_reply_events SET status = 'processing', updated_at = ? WHERE event_id = ? AND status IN ('received', 'retry')"
+  ).bind(now, event.eventId).run();
+  if (Number(claim.meta.changes ?? 0) !== 1) return;
+  try {
+    await handleQuickReply(env, event);
+    await env.DB.prepare("UPDATE quick_reply_events SET status = 'completed', updated_at = ? WHERE event_id = ?")
+      .bind(Math.floor(Date.now() / 1000), event.eventId).run();
+  } catch (error) {
+    await env.DB.prepare("UPDATE quick_reply_events SET status = 'retry', updated_at = ? WHERE event_id = ?")
+      .bind(Math.floor(Date.now() / 1000), event.eventId).run();
+    throw error;
+  }
+}
+
 async function claimEvent(env: Env, event: CommentEvent): Promise<boolean> {
   const now = Math.floor(Date.now() / 1000);
   await env.DB.prepare(
@@ -558,10 +642,10 @@ async function processEvent(env: Env, event: CommentEvent): Promise<void> {
   const followConfirmed = resolved.isDefault && isFollowConfirmation(event.text) && await hasFollowPrompt(env, event.commenterId);
   if (resolved.isDefault && !followConfirmed) await rememberFollowPrompt(env, event.commenterId);
   const publicReply = resolved.isDefault && !followConfirmed
-    ? "Please follow @igstore_in, then comment DONE to receive the link."
+    ? "Please check your DM to get access."
     : render(config!.publicReply, event);
   const privateReply = resolved.isDefault && !followConfirmed
-    ? "Hi {{username}}, pehle @igstore_in ko follow karein: https://www.instagram.com/igstore_in/\n\nFollow karne ke baad isi Reel par DONE comment karein; phir hum IGStore.in link bhej denge."
+    ? render("Hey {{username}}! Tap below and I'll send you the access in just a moment.", event)
     : render(config!.privateReply, event);
   await recordActivity(env, event, "processing", { publicReply, privateReply });
   await runAction(env, event, "public_reply", () =>
@@ -570,7 +654,12 @@ async function processEvent(env: Env, event: CommentEvent): Promise<void> {
   await runAction(env, event, "private_reply", () =>
     graphPost(env, `${ownerId}/messages`, {
       recipient: { comment_id: event.commentId },
-      message: { text: privateReply }
+      message: {
+        text: privateReply,
+        ...(resolved.isDefault && !followConfirmed
+          ? { quick_replies: [{ content_type: "text", title: "Send me the access", payload: "IGSTORE_ACCESS" }] }
+          : {})
+      }
     })
   );
   await markEvent(env, event.eventId, "completed");
@@ -614,9 +703,11 @@ async function handleFetch(request: Request, env: Env): Promise<Response> {
     return json({ error: "Invalid JSON" }, 400);
   }
   const events = extractCommentEvents(payload);
+  const quickReplies = extractQuickReplyEvents(payload);
   if (events.length > 0) await env.COMMENT_QUEUE.sendBatch(events.map((body) => ({ body })));
-  console.log(JSON.stringify({ level: "info", event: "webhook_accepted", count: events.length }));
-  return json({ received: true, queued: events.length });
+  for (const quickReply of quickReplies) await processQuickReply(env, quickReply);
+  console.log(JSON.stringify({ level: "info", event: "webhook_accepted", comments: events.length, quickReplies: quickReplies.length }));
+  return json({ received: true, queued: events.length, quickReplies: quickReplies.length });
 }
 
 export default {
