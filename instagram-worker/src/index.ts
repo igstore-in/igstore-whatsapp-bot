@@ -57,6 +57,12 @@ type StoredRule = {
   updated_at: number;
 };
 
+type ReelMetadata = {
+  media_id: string;
+  shortcode: string | null;
+  permalink: string | null;
+};
+
 function text(body: string, status = 200): Response {
   return new Response(body, {
     status,
@@ -230,9 +236,15 @@ async function configForEvent(env: Env, mediaId: string): Promise<ReelConfig | u
   return fallback ? ruleToConfig(fallback) : configFor(mediaId) ?? defaultConfig();
 }
 
-function publicRule(rule: StoredRule): Record<string, unknown> {
+async function ensureReelMetadataTable(env: Env): Promise<void> {
+  await env.DB.exec(
+    "CREATE TABLE IF NOT EXISTS reel_metadata (media_id TEXT PRIMARY KEY, shortcode TEXT, permalink TEXT, updated_at INTEGER NOT NULL)"
+  );
+}
+
+function publicRule(rule: StoredRule, metadata?: ReelMetadata): Record<string, unknown> {
   const config = ruleToConfig(rule);
-  return { mediaId: rule.media_id, ...config, updatedAt: rule.updated_at };
+  return { mediaId: rule.media_id, shortcode: metadata?.shortcode ?? null, permalink: metadata?.permalink ?? null, ...config, updatedAt: rule.updated_at };
 }
 
 async function parseJson(request: Request): Promise<Record<string, unknown> | undefined> {
@@ -244,8 +256,7 @@ async function parseJson(request: Request): Promise<Record<string, unknown> | un
   }
 }
 
-function validateRule(mediaId: string, value: Record<string, unknown>): { rule?: Omit<StoredRule, "media_id" | "updated_at">; error?: string } {
-  if (!(mediaId === "default" || /^\d{5,}$/.test(mediaId))) return { error: "Use a numeric Reel media ID or the word default." };
+function validateRule(value: Record<string, unknown>): { rule?: Omit<StoredRule, "media_id" | "updated_at">; error?: string } {
   const enabled = value.enabled === true;
   const keywords = Array.isArray(value.keywords) ? value.keywords.filter((item): item is string => typeof item === "string").map((item) => item.trim()).filter(Boolean).slice(0, 30) : [];
   const publicReply = typeof value.publicReply === "string" ? value.publicReply.trim() : "";
@@ -253,6 +264,47 @@ function validateRule(mediaId: string, value: Record<string, unknown>): { rule?:
   if (!publicReply || !privateReply) return { error: "Public reply and private DM reply are required." };
   if (publicReply.length > 1000 || privateReply.length > 1000) return { error: "Each reply must be 1,000 characters or fewer." };
   return { rule: { enabled: enabled ? 1 : 0, keywords_json: JSON.stringify(keywords), public_reply: publicReply, private_reply: privateReply } };
+}
+
+function shortcodeFromInput(value: string): string | undefined {
+  const normalized = value.trim();
+  const linkMatch = normalized.match(/instagram\.com\/(?:reel|p)\/([A-Za-z0-9_-]+)/i);
+  if (linkMatch) return linkMatch[1];
+  return /^[A-Za-z0-9_-]{5,}$/.test(normalized) && !/^\d+$/.test(normalized) ? normalized : undefined;
+}
+
+function shortcodeFromPermalink(value: string): string | undefined {
+  return value.match(/instagram\.com\/(?:reel|p)\/([A-Za-z0-9_-]+)/i)?.[1];
+}
+
+async function graphGet<T>(env: Env, path: string): Promise<T> {
+  const host = (env.META_GRAPH_HOST || "https://graph.instagram.com").replace(/\/$/, "");
+  const version = env.META_GRAPH_VERSION || "v25.0";
+  const response = await fetch(`${host}/${version}/${path}`, { headers: { authorization: `Bearer ${env.META_ACCESS_TOKEN}` } });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok || (result as { error?: unknown }).error) {
+    const details = sanitizedMetaError(result);
+    throw new MetaApiError(details.message || `Meta API returned HTTP ${response.status}`, false, response.status, details);
+  }
+  return result as T;
+}
+
+async function resolveReel(env: Env, input: string): Promise<{ mediaId: string; shortcode?: string; permalink?: string }> {
+  if (input === "default") return { mediaId: "default" };
+  if (/^\d{5,}$/.test(input)) return { mediaId: input };
+  const shortcode = shortcodeFromInput(input);
+  if (!shortcode) throw new Error("Paste an Instagram Reel link, shortcode, numeric media ID, or default.");
+  if (!env.IG_USER_ID) throw new Error("Instagram account ID is not configured.");
+  let after = "";
+  for (let page = 0; page < 5; page += 1) {
+    const query = `fields=id,permalink,media_product_type&limit=100${after ? `&after=${encodeURIComponent(after)}` : ""}`;
+    const result = await graphGet<{ data?: Array<{ id?: string; permalink?: string }>; paging?: { cursors?: { after?: string } } }>(env, `${env.IG_USER_ID}/media?${query}`);
+    const match = result.data?.find((media) => shortcodeFromPermalink(media.permalink ?? "") === shortcode);
+    if (match?.id) return { mediaId: match.id, shortcode, permalink: match.permalink };
+    after = result.paging?.cursors?.after ?? "";
+    if (!after) break;
+  }
+  throw new Error("Reel not found in the connected Instagram account. Ensure it belongs to this account and is among its recent media.");
 }
 
 async function handleAdmin(request: Request, env: Env, url: URL): Promise<Response | undefined> {
@@ -271,6 +323,7 @@ async function handleAdmin(request: Request, env: Env, url: URL): Promise<Respon
     return new Response(JSON.stringify({ ok: true }), { headers: { "content-type": "application/json; charset=utf-8", "set-cookie": "igstore_admin=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0" } });
   }
   if (!(await isAdmin(request, env))) return json({ error: "Unauthorized" }, 401);
+  await ensureReelMetadataTable(env);
   if (url.pathname === "/api/admin/overview" && request.method === "GET") {
     const rows = await env.DB.prepare(
       "SELECT SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS completed, SUM(CASE WHEN status IN ('received','processing','retry') THEN 1 ELSE 0 END) AS pending, SUM(CASE WHEN status LIKE 'failed%' THEN 1 ELSE 0 END) AS failed FROM events"
@@ -281,24 +334,39 @@ async function handleAdmin(request: Request, env: Env, url: URL): Promise<Respon
     const { results } = await env.DB.prepare(
       "SELECT media_id, enabled, keywords_json, public_reply, private_reply, updated_at FROM reel_rules ORDER BY CASE WHEN media_id = 'default' THEN 0 ELSE 1 END, updated_at DESC"
     ).all<StoredRule>();
-    return json({ rules: results.map(publicRule) });
+    const metadata = await env.DB.prepare("SELECT media_id, shortcode, permalink FROM reel_metadata").all<ReelMetadata>();
+    const metadataByMediaId = new Map(metadata.results.map((item) => [item.media_id, item]));
+    return json({ rules: results.map((rule) => publicRule(rule, metadataByMediaId.get(rule.media_id))) });
   }
   const prefix = "/api/admin/rules/";
   if (url.pathname.startsWith(prefix)) {
-    const mediaId = decodeURIComponent(url.pathname.slice(prefix.length));
+    const reelInput = decodeURIComponent(url.pathname.slice(prefix.length));
     if (request.method === "PUT") {
       const body = await parseJson(request);
       if (!body) return json({ error: "Invalid JSON" }, 400);
-      const validated = validateRule(mediaId, body);
+      const validated = validateRule(body);
       if (!validated.rule) return json({ error: validated.error }, 400);
+      let reel: { mediaId: string; shortcode?: string; permalink?: string };
+      try {
+        reel = await resolveReel(env, reelInput);
+      } catch (error) {
+        return json({ error: error instanceof Error ? error.message : "Could not resolve this Reel." }, 400);
+      }
       const now = Math.floor(Date.now() / 1000);
       await env.DB.prepare(
         "INSERT INTO reel_rules (media_id, enabled, keywords_json, public_reply, private_reply, updated_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(media_id) DO UPDATE SET enabled = excluded.enabled, keywords_json = excluded.keywords_json, public_reply = excluded.public_reply, private_reply = excluded.private_reply, updated_at = excluded.updated_at"
-      ).bind(mediaId, validated.rule.enabled, validated.rule.keywords_json, validated.rule.public_reply, validated.rule.private_reply, now).run();
-      return json({ ok: true });
+      ).bind(reel.mediaId, validated.rule.enabled, validated.rule.keywords_json, validated.rule.public_reply, validated.rule.private_reply, now).run();
+      if (reel.mediaId !== "default") {
+        await env.DB.prepare(
+          "INSERT INTO reel_metadata (media_id, shortcode, permalink, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(media_id) DO UPDATE SET shortcode = excluded.shortcode, permalink = excluded.permalink, updated_at = excluded.updated_at"
+        ).bind(reel.mediaId, reel.shortcode ?? null, reel.permalink ?? null, now).run();
+      }
+      return json({ ok: true, mediaId: reel.mediaId, permalink: reel.permalink ?? null });
     }
     if (request.method === "DELETE") {
+      const mediaId = reelInput;
       await env.DB.prepare("DELETE FROM reel_rules WHERE media_id = ?").bind(mediaId).run();
+      await env.DB.prepare("DELETE FROM reel_metadata WHERE media_id = ?").bind(mediaId).run();
       return json({ ok: true });
     }
   }
