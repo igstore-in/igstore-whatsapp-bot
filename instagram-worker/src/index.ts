@@ -63,6 +63,21 @@ type ReelMetadata = {
   permalink: string | null;
 };
 
+type ActivityRow = {
+  event_id: string;
+  media_id: string;
+  username: string | null;
+  comment_text: string | null;
+  public_reply: string | null;
+  private_reply: string | null;
+  status: string;
+  error: string | null;
+  received_at: number;
+  updated_at: number;
+  public_status: string | null;
+  private_status: string | null;
+};
+
 function text(body: string, status = 200): Response {
   return new Response(body, {
     status,
@@ -242,6 +257,22 @@ async function ensureReelMetadataTable(env: Env): Promise<void> {
   );
 }
 
+async function ensureActivityTable(env: Env): Promise<void> {
+  await env.DB.exec(
+    "CREATE TABLE IF NOT EXISTS comment_activity (event_id TEXT PRIMARY KEY, comment_id TEXT NOT NULL, media_id TEXT NOT NULL, username TEXT, comment_text TEXT, public_reply TEXT, private_reply TEXT, status TEXT NOT NULL, error TEXT, received_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)"
+  );
+}
+
+async function recordActivity(env: Env, event: CommentEvent, status: string, replies?: { publicReply?: string; privateReply?: string }, error?: string): Promise<void> {
+  await ensureActivityTable(env);
+  const now = Math.floor(Date.now() / 1000);
+  await env.DB.prepare(
+    `INSERT INTO comment_activity (event_id, comment_id, media_id, username, comment_text, public_reply, private_reply, status, error, received_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(event_id) DO UPDATE SET public_reply = COALESCE(excluded.public_reply, comment_activity.public_reply), private_reply = COALESCE(excluded.private_reply, comment_activity.private_reply), status = excluded.status, error = excluded.error, updated_at = excluded.updated_at`
+  ).bind(event.eventId, event.commentId, event.mediaId, event.username || null, event.text || null, replies?.publicReply ?? null, replies?.privateReply ?? null, status, error?.slice(0, 500) ?? null, event.receivedAt, now).run();
+}
+
 function publicRule(rule: StoredRule, metadata?: ReelMetadata): Record<string, unknown> {
   const config = ruleToConfig(rule);
   return { mediaId: rule.media_id, shortcode: metadata?.shortcode ?? null, permalink: metadata?.permalink ?? null, ...config, updatedAt: rule.updated_at };
@@ -324,6 +355,7 @@ async function handleAdmin(request: Request, env: Env, url: URL): Promise<Respon
   }
   if (!(await isAdmin(request, env))) return json({ error: "Unauthorized" }, 401);
   await ensureReelMetadataTable(env);
+  await ensureActivityTable(env);
   if (url.pathname === "/api/admin/overview" && request.method === "GET") {
     const rows = await env.DB.prepare(
       "SELECT SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS completed, SUM(CASE WHEN status IN ('received','processing','retry') THEN 1 ELSE 0 END) AS pending, SUM(CASE WHEN status LIKE 'failed%' THEN 1 ELSE 0 END) AS failed FROM events"
@@ -337,6 +369,18 @@ async function handleAdmin(request: Request, env: Env, url: URL): Promise<Respon
     const metadata = await env.DB.prepare("SELECT media_id, shortcode, permalink FROM reel_metadata").all<ReelMetadata>();
     const metadataByMediaId = new Map(metadata.results.map((item) => [item.media_id, item]));
     return json({ rules: results.map((rule) => publicRule(rule, metadataByMediaId.get(rule.media_id))) });
+  }
+  if (url.pathname === "/api/admin/activity" && request.method === "GET") {
+    const limit = Math.min(100, Math.max(1, Number.parseInt(url.searchParams.get("limit") ?? "50", 10) || 50));
+    const { results } = await env.DB.prepare(
+      `SELECT a.event_id, a.media_id, a.username, a.comment_text, a.public_reply, a.private_reply, a.status, a.error, a.received_at, a.updated_at,
+        public_action.status AS public_status, private_action.status AS private_status
+       FROM comment_activity a
+       LEFT JOIN actions public_action ON public_action.event_id = a.event_id AND public_action.action = 'public_reply'
+       LEFT JOIN actions private_action ON private_action.event_id = a.event_id AND private_action.action = 'private_reply'
+       ORDER BY a.updated_at DESC LIMIT ?`
+    ).bind(limit).all<ActivityRow>();
+    return json({ activity: results });
   }
   const prefix = "/api/admin/rules/";
   if (url.pathname.startsWith(prefix)) {
@@ -468,6 +512,7 @@ async function markEvent(env: Env, eventId: string, status: string, error?: stri
 
 async function processEvent(env: Env, event: CommentEvent): Promise<void> {
   if (!(await claimEvent(env, event))) return;
+  await recordActivity(env, event, "processing");
   const ownerId = event.ownerId || env.IG_USER_ID || "";
   const config = await configForEvent(env, event.mediaId);
   const ignoreReason =
@@ -479,19 +524,24 @@ async function processEvent(env: Env, event: CommentEvent): Promise<void> {
     (config && !matchesKeywords(event.text, config.keywords) && "keyword_miss");
   if (ignoreReason) {
     await markEvent(env, event.eventId, `ignored:${ignoreReason}`);
+    await recordActivity(env, event, `ignored:${ignoreReason}`);
     console.log(JSON.stringify({ level: "info", event: "comment_ignored", eventId: event.eventId, mediaId: event.mediaId, reason: ignoreReason }));
     return;
   }
+  const publicReply = render(config!.publicReply, event);
+  const privateReply = render(config!.privateReply, event);
+  await recordActivity(env, event, "processing", { publicReply, privateReply });
   await runAction(env, event, "public_reply", () =>
-    graphPost(env, `${event.commentId}/replies`, { message: render(config!.publicReply, event) })
+    graphPost(env, `${event.commentId}/replies`, { message: publicReply })
   );
   await runAction(env, event, "private_reply", () =>
     graphPost(env, `${ownerId}/messages`, {
       recipient: { comment_id: event.commentId },
-      message: { text: render(config!.privateReply, event) }
+      message: { text: privateReply }
     })
   );
   await markEvent(env, event.eventId, "completed");
+  await recordActivity(env, event, "completed", { publicReply, privateReply });
   console.log(JSON.stringify({ level: "info", event: "comment_completed", eventId: event.eventId, mediaId: event.mediaId }));
 }
 
@@ -548,6 +598,7 @@ export default {
         const safeError = error instanceof MetaApiError ? error.details : { message: error instanceof Error ? error.message : "Unknown error" };
         console.error(JSON.stringify({ level: "error", event: "comment_failed", eventId: message.body.eventId, mediaId: message.body.mediaId, retryable, error: safeError }));
         await markEvent(env, message.body.eventId, retryable ? "retry" : "failed_permanent", safeError.message);
+        await recordActivity(env, message.body, retryable ? "retry" : "failed_permanent", undefined, safeError.message);
         if (retryable) {
           const delaySeconds = Math.min(900, 30 * 2 ** Math.max(0, message.attempts - 1));
           message.retry({ delaySeconds });
