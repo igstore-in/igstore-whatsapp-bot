@@ -1,6 +1,3 @@
-Exit code: 0
-Wall time: 1.2 seconds
-Output:
 CREATE TABLE IF NOT EXISTS reel_rules (
   media_id TEXT PRIMARY KEY,
   enabled INTEGER NOT NULL DEFAULT 1,
