@@ -228,10 +228,11 @@ function extractQuickReplyEvents(payload: unknown): QuickReplyEvent[] {
       const message = rawMessage as {
         sender?: { id?: unknown };
         message?: { mid?: unknown; quick_reply?: { payload?: unknown } };
+        postback?: { mid?: unknown; payload?: unknown };
       };
-      const eventId = String(message.message?.mid ?? "");
+      const eventId = String(message.message?.mid ?? message.postback?.mid ?? "");
       const senderId = String(message.sender?.id ?? "");
-      const replyPayload = String(message.message?.quick_reply?.payload ?? "");
+      const replyPayload = String(message.message?.quick_reply?.payload ?? message.postback?.payload ?? "");
       if (eventId && senderId && replyPayload) events.push({ eventId, senderId, payload: replyPayload });
     }
   }
@@ -507,6 +508,18 @@ async function graphPost(
 }
 
 type QuickReply = { content_type: "text"; title: string; payload: string };
+type TemplateButton =
+  | { type: "web_url"; title: string; url: string }
+  | { type: "postback"; title: string; payload: string };
+
+function buttonTemplate(messageText: string, buttons: TemplateButton[]): Record<string, unknown> {
+  return {
+    attachment: {
+      type: "template",
+      payload: { template_type: "button", text: messageText, buttons }
+    }
+  };
+}
 
 async function sendDirectMessage(
   env: Env,
@@ -522,21 +535,39 @@ async function sendDirectMessage(
   });
 }
 
+async function sendButtonMessage(
+  env: Env,
+  recipientId: string,
+  messageText: string,
+  buttons: TemplateButton[]
+): Promise<void> {
+  const ownerId = env.IG_USER_ID;
+  if (!ownerId) throw new Error("Instagram account ID is not configured.");
+  await graphPost(env, `${ownerId}/messages`, {
+    recipient: { id: recipientId },
+    message: buttonTemplate(messageText, buttons)
+  });
+}
+
 async function handleQuickReply(env: Env, event: QuickReplyEvent): Promise<void> {
   if (event.payload === "IGSTORE_ACCESS") {
-    await sendDirectMessage(
+    await sendButtonMessage(
       env,
       event.senderId,
-      "Before I send the store access, please follow @igstore_in: https://www.instagram.com/igstore_in/\n\nThen tap the confirmation below.",
-      [{ content_type: "text", title: "I'm following", payload: "IGSTORE_FOLLOW_CONFIRMED" }]
+      "Before I send the store access, please follow @igstore_in. Then tap the confirmation below.",
+      [
+        { type: "web_url", title: "Visit Profile", url: "https://www.instagram.com/igstore_in/" },
+        { type: "postback", title: "I'm following", payload: "IGSTORE_FOLLOW_CONFIRMED" }
+      ]
     );
     return;
   }
   if (event.payload === "IGSTORE_FOLLOW_CONFIRMED") {
-    await sendDirectMessage(
+    await sendButtonMessage(
       env,
       event.senderId,
-      "Thank you! Here is your IGStore.in access link: https://igstore.in/"
+      "Thank you! Your IGStore.in access is ready.",
+      [{ type: "web_url", title: "Open IGStore.in", url: "https://igstore.in/" }]
     );
   }
 }
@@ -639,12 +670,11 @@ async function processEvent(env: Env, event: CommentEvent): Promise<void> {
     console.log(JSON.stringify({ level: "info", event: "comment_ignored", eventId: event.eventId, mediaId: event.mediaId, reason: ignoreReason }));
     return;
   }
-  const followConfirmed = resolved.isDefault && isFollowConfirmation(event.text) && await hasFollowPrompt(env, event.commenterId);
-  if (resolved.isDefault && !followConfirmed) await rememberFollowPrompt(env, event.commenterId);
-  const publicReply = resolved.isDefault && !followConfirmed
+  const useAccessFlow = resolved.isDefault;
+  const publicReply = useAccessFlow
     ? "Please check your DM to get access."
     : render(config!.publicReply, event);
-  const privateReply = resolved.isDefault && !followConfirmed
+  const privateReply = useAccessFlow
     ? render("Hey {{username}}! Tap below and I'll send you the access in just a moment.", event)
     : render(config!.privateReply, event);
   await recordActivity(env, event, "processing", { publicReply, privateReply });
@@ -654,12 +684,9 @@ async function processEvent(env: Env, event: CommentEvent): Promise<void> {
   await runAction(env, event, "private_reply", () =>
     graphPost(env, `${ownerId}/messages`, {
       recipient: { comment_id: event.commentId },
-      message: {
-        text: privateReply,
-        ...(resolved.isDefault && !followConfirmed
-          ? { quick_replies: [{ content_type: "text", title: "Send me the access", payload: "IGSTORE_ACCESS" }] }
-          : {})
-      }
+      message: useAccessFlow
+        ? buttonTemplate(privateReply, [{ type: "postback", title: "Send me the access", payload: "IGSTORE_ACCESS" }])
+        : { text: privateReply }
     })
   );
   await markEvent(env, event.eventId, "completed");
