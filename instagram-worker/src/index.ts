@@ -1,4 +1,8 @@
-import { configFor } from "./reel-config";
+Exit code: 0
+Wall time: 1 seconds
+Output:
+import { configFor, defaultConfig, type ReelConfig } from "./reel-config";
+import { adminHtml } from "./admin";
 
 export interface Env {
   META_VERIFY_TOKEN: string;
@@ -7,6 +11,7 @@ export interface Env {
   IG_USER_ID?: string;
   META_GRAPH_VERSION?: string;
   META_GRAPH_HOST?: string;
+  ADMIN_PASSWORD?: string;
   DB: D1Database;
   COMMENT_QUEUE: Queue<CommentEvent>;
 }
@@ -46,6 +51,15 @@ class MetaApiError extends Error {
 
 const encoder = new TextEncoder();
 
+type StoredRule = {
+  media_id: string;
+  enabled: number;
+  keywords_json: string;
+  public_reply: string;
+  private_reply: string;
+  updated_at: number;
+};
+
 function text(body: string, status = 200): Response {
   return new Response(body, {
     status,
@@ -68,6 +82,55 @@ function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
   let mismatch = 0;
   for (let index = 0; index < a.length; index += 1) mismatch |= a[index] ^ b[index];
   return mismatch === 0;
+}
+
+function cookieValue(request: Request, name: string): string | undefined {
+  return request.headers
+    .get("cookie")
+    ?.split(";")
+    .map((part) => part.trim().split("="))
+    .find(([key]) => key === name)?.[1];
+}
+
+function base64Url(value: Uint8Array): string {
+  let binary = "";
+  for (const byte of value) binary += String.fromCharCode(byte);
+  return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
+}
+
+function fromBase64Url(value: string): Uint8Array | undefined {
+  try {
+    const padded = value.replaceAll("-", "+").replaceAll("_", "/") + "=".repeat((4 - (value.length % 4)) % 4);
+    return Uint8Array.from(atob(padded), (character) => character.charCodeAt(0));
+  } catch {
+    return undefined;
+  }
+}
+
+async function sessionSignature(payload: string, password: string): Promise<string> {
+  const key = await crypto.subtle.importKey("raw", encoder.encode(password), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  return base64Url(new Uint8Array(await crypto.subtle.sign("HMAC", key, encoder.encode(payload))));
+}
+
+async function makeSession(password: string): Promise<string> {
+  const payload = base64Url(encoder.encode(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 8 * 60 * 60 })));
+  return `${payload}.${await sessionSignature(payload, password)}`;
+}
+
+async function isAdmin(request: Request, env: Env): Promise<boolean> {
+  if (!env.ADMIN_PASSWORD) return false;
+  const token = cookieValue(request, "igstore_admin");
+  const [payload, signature] = token?.split(".") ?? [];
+  if (!payload || !signature) return false;
+  const expected = await sessionSignature(payload, env.ADMIN_PASSWORD);
+  if (!bytesEqual(encoder.encode(signature), encoder.encode(expected))) return false;
+  try {
+    const decoded = fromBase64Url(payload);
+    const session = JSON.parse(new TextDecoder().decode(decoded)) as { exp?: number };
+    return typeof session.exp === "number" && session.exp > Math.floor(Date.now() / 1000);
+  } catch {
+    return false;
+  }
 }
 
 function hexToBytes(hex: string): Uint8Array | undefined {
@@ -141,6 +204,108 @@ function matchesKeywords(textValue: string, keywords: string[]): boolean {
   if (keywords.length === 0) return true;
   const normalized = textValue.toLocaleLowerCase();
   return keywords.some((keyword) => normalized.includes(keyword.toLocaleLowerCase()));
+}
+
+function ruleToConfig(rule: StoredRule): ReelConfig {
+  let keywords: string[] = [];
+  try {
+    const parsed = JSON.parse(rule.keywords_json);
+    keywords = Array.isArray(parsed) ? parsed.filter((value): value is string => typeof value === "string").slice(0, 30) : [];
+  } catch {
+    keywords = [];
+  }
+  return {
+    enabled: rule.enabled === 1,
+    keywords,
+    publicReply: rule.public_reply,
+    privateReply: rule.private_reply
+  };
+}
+
+async function configForEvent(env: Env, mediaId: string): Promise<ReelConfig | undefined> {
+  const exact = await env.DB.prepare(
+    "SELECT media_id, enabled, keywords_json, public_reply, private_reply, updated_at FROM reel_rules WHERE media_id = ?"
+  ).bind(mediaId).first<StoredRule>();
+  if (exact) return ruleToConfig(exact);
+  const fallback = await env.DB.prepare(
+    "SELECT media_id, enabled, keywords_json, public_reply, private_reply, updated_at FROM reel_rules WHERE media_id = 'default'"
+  ).first<StoredRule>();
+  return fallback ? ruleToConfig(fallback) : configFor(mediaId) ?? defaultConfig();
+}
+
+function publicRule(rule: StoredRule): Record<string, unknown> {
+  const config = ruleToConfig(rule);
+  return { mediaId: rule.media_id, ...config, updatedAt: rule.updated_at };
+}
+
+async function parseJson(request: Request): Promise<Record<string, unknown> | undefined> {
+  try {
+    const value = await request.json();
+    return value && typeof value === "object" ? value as Record<string, unknown> : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function validateRule(mediaId: string, value: Record<string, unknown>): { rule?: Omit<StoredRule, "media_id" | "updated_at">; error?: string } {
+  if (!(mediaId === "default" || /^\d{5,}$/.test(mediaId))) return { error: "Use a numeric Reel media ID or the word default." };
+  const enabled = value.enabled === true;
+  const keywords = Array.isArray(value.keywords) ? value.keywords.filter((item): item is string => typeof item === "string").map((item) => item.trim()).filter(Boolean).slice(0, 30) : [];
+  const publicReply = typeof value.publicReply === "string" ? value.publicReply.trim() : "";
+  const privateReply = typeof value.privateReply === "string" ? value.privateReply.trim() : "";
+  if (!publicReply || !privateReply) return { error: "Public reply and private DM reply are required." };
+  if (publicReply.length > 1000 || privateReply.length > 1000) return { error: "Each reply must be 1,000 characters or fewer." };
+  return { rule: { enabled: enabled ? 1 : 0, keywords_json: JSON.stringify(keywords), public_reply: publicReply, private_reply: privateReply } };
+}
+
+async function handleAdmin(request: Request, env: Env, url: URL): Promise<Response | undefined> {
+  if (url.pathname === "/admin" && request.method === "GET") {
+    return new Response(adminHtml, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } });
+  }
+  if (!url.pathname.startsWith("/api/admin/")) return undefined;
+  if (url.pathname === "/api/admin/login" && request.method === "POST") {
+    const body = await parseJson(request);
+    const supplied = typeof body?.password === "string" ? body.password : "";
+    if (!env.ADMIN_PASSWORD || !bytesEqual(encoder.encode(supplied), encoder.encode(env.ADMIN_PASSWORD))) return json({ error: "Invalid password" }, 401);
+    const session = await makeSession(env.ADMIN_PASSWORD);
+    return new Response(JSON.stringify({ ok: true }), { headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", "set-cookie": `igstore_admin=${session}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=28800` } });
+  }
+  if (url.pathname === "/api/admin/logout" && request.method === "POST") {
+    return new Response(JSON.stringify({ ok: true }), { headers: { "content-type": "application/json; charset=utf-8", "set-cookie": "igstore_admin=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0" } });
+  }
+  if (!(await isAdmin(request, env))) return json({ error: "Unauthorized" }, 401);
+  if (url.pathname === "/api/admin/overview" && request.method === "GET") {
+    const rows = await env.DB.prepare(
+      "SELECT SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS completed, SUM(CASE WHEN status IN ('received','processing','retry') THEN 1 ELSE 0 END) AS pending, SUM(CASE WHEN status LIKE 'failed%' THEN 1 ELSE 0 END) AS failed FROM events"
+    ).first<{ completed?: number; pending?: number; failed?: number }>();
+    return json({ completed: Number(rows?.completed ?? 0), pending: Number(rows?.pending ?? 0), failed: Number(rows?.failed ?? 0) });
+  }
+  if (url.pathname === "/api/admin/rules" && request.method === "GET") {
+    const { results } = await env.DB.prepare(
+      "SELECT media_id, enabled, keywords_json, public_reply, private_reply, updated_at FROM reel_rules ORDER BY CASE WHEN media_id = 'default' THEN 0 ELSE 1 END, updated_at DESC"
+    ).all<StoredRule>();
+    return json({ rules: results.map(publicRule) });
+  }
+  const prefix = "/api/admin/rules/";
+  if (url.pathname.startsWith(prefix)) {
+    const mediaId = decodeURIComponent(url.pathname.slice(prefix.length));
+    if (request.method === "PUT") {
+      const body = await parseJson(request);
+      if (!body) return json({ error: "Invalid JSON" }, 400);
+      const validated = validateRule(mediaId, body);
+      if (!validated.rule) return json({ error: validated.error }, 400);
+      const now = Math.floor(Date.now() / 1000);
+      await env.DB.prepare(
+        "INSERT INTO reel_rules (media_id, enabled, keywords_json, public_reply, private_reply, updated_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(media_id) DO UPDATE SET enabled = excluded.enabled, keywords_json = excluded.keywords_json, public_reply = excluded.public_reply, private_reply = excluded.private_reply, updated_at = excluded.updated_at"
+      ).bind(mediaId, validated.rule.enabled, validated.rule.keywords_json, validated.rule.public_reply, validated.rule.private_reply, now).run();
+      return json({ ok: true });
+    }
+    if (request.method === "DELETE") {
+      await env.DB.prepare("DELETE FROM reel_rules WHERE media_id = ?").bind(mediaId).run();
+      return json({ ok: true });
+    }
+  }
+  return json({ error: "Not found" }, 404);
 }
 
 function sanitizedMetaError(value: unknown): MetaError {
@@ -239,13 +404,13 @@ async function markEvent(env: Env, eventId: string, status: string, error?: stri
 async function processEvent(env: Env, event: CommentEvent): Promise<void> {
   if (!(await claimEvent(env, event))) return;
   const ownerId = event.ownerId || env.IG_USER_ID || "";
-  const config = configFor(event.mediaId);
+  const config = await configForEvent(env, event.mediaId);
   const ignoreReason =
     (!ownerId && "missing_owner_id") ||
     (event.parentId && "reply_comment") ||
     (event.commenterId && event.commenterId === ownerId && "self_comment") ||
     (event.mediaProductType && event.mediaProductType !== "REELS" && "not_reel") ||
-    (!config && "disabled") ||
+    ((!config || !config.enabled) && "disabled") ||
     (config && !matchesKeywords(event.text, config.keywords) && "keyword_miss");
   if (ignoreReason) {
     await markEvent(env, event.eventId, `ignored:${ignoreReason}`);
@@ -267,6 +432,8 @@ async function processEvent(env: Env, event: CommentEvent): Promise<void> {
 
 async function handleFetch(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
+  const adminResponse = await handleAdmin(request, env, url);
+  if (adminResponse) return adminResponse;
   if (url.pathname === "/health" && request.method === "GET") {
     try {
       await env.DB.prepare("SELECT 1").first();
@@ -299,7 +466,7 @@ async function handleFetch(request: Request, env: Env): Promise<Response> {
     return json({ error: "Invalid JSON" }, 400);
   }
   const events = extractCommentEvents(payload);
-  await env.COMMENT_QUEUE.sendBatch(events.map((body) => ({ body })));
+  if (events.length > 0) await env.COMMENT_QUEUE.sendBatch(events.map((body) => ({ body })));
   console.log(JSON.stringify({ level: "info", event: "webhook_accepted", count: events.length }));
   return json({ received: true, queued: events.length });
 }
@@ -326,3 +493,4 @@ export default {
     }
   }
 } satisfies ExportedHandler<Env, CommentEvent>;
+
