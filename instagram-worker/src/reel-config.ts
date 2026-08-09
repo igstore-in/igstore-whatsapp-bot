@@ -11,15 +11,16 @@ export const REEL_CONFIG: Record<string, ReelConfig> = {
   // "REEL_MEDIA_ID": {
   //   enabled: true,
   //   keywords: ["link", "price"],
-  //   publicReply: "Thank you â¤ï¸ Details aapke DM mein bhej di hain.",
-  //   privateReply: "Hi {{username}} ðŸ‘‹\nYeh raha is Reel ka link: https://igstore.in/"
+  //   publicReply: "Thank you! Details aapke DM mein bhej di hain.",
+  //   privateReply: "Hi {{username}}\nYeh raha is Reel ka link: https://igstore.in/"
   // },
   default: {
     enabled: true,
-    keywords: ["link", "price", "buy", "order", "details", "custom", "dm"],
-    publicReply: "Thank you â¤ï¸ Details aapke DM mein bhej di hain.",
+    // Empty means every new top-level comment on a Reel without its own rule.
+    keywords: [],
+    publicReply: "Thank you! Details aapke DM mein bhej di hain.",
     privateReply:
-      "Hi {{username}} ðŸ‘‹\nComment karne ke liye thank you!\n\nðŸ›ï¸ IG Store: https://igstore.in/\nðŸ“© Custom order ke liye isi message ka reply karein.\nðŸšš Pan-India delivery available."
+      "Hi {{username}},\nComment karne ke liye thank you!\n\n[ IGStore.in ] https://igstore.in/\nCustom order ke liye isi message ka reply karein.\nPan-India delivery available."
   }
 };
 
