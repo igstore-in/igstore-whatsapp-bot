@@ -240,15 +240,17 @@ function ruleToConfig(rule: StoredRule): ReelConfig {
   };
 }
 
-async function configForEvent(env: Env, mediaId: string): Promise<ReelConfig | undefined> {
+type ResolvedConfig = { config: ReelConfig | undefined; isDefault: boolean };
+
+async function configForEvent(env: Env, mediaId: string): Promise<ResolvedConfig> {
   const exact = await env.DB.prepare(
     "SELECT media_id, enabled, keywords_json, public_reply, private_reply, updated_at FROM reel_rules WHERE media_id = ?"
   ).bind(mediaId).first<StoredRule>();
-  if (exact) return ruleToConfig(exact);
+  if (exact) return { config: ruleToConfig(exact), isDefault: false };
   const fallback = await env.DB.prepare(
     "SELECT media_id, enabled, keywords_json, public_reply, private_reply, updated_at FROM reel_rules WHERE media_id = 'default'"
   ).first<StoredRule>();
-  return fallback ? ruleToConfig(fallback) : configFor(mediaId) ?? defaultConfig();
+  return { config: fallback ? ruleToConfig(fallback) : configFor(mediaId) ?? defaultConfig(), isDefault: true };
 }
 
 async function ensureReelMetadataTable(env: Env): Promise<void> {
@@ -261,6 +263,31 @@ async function ensureActivityTable(env: Env): Promise<void> {
   await env.DB.exec(
     "CREATE TABLE IF NOT EXISTS comment_activity (event_id TEXT PRIMARY KEY, comment_id TEXT NOT NULL, media_id TEXT NOT NULL, username TEXT, comment_text TEXT, public_reply TEXT, private_reply TEXT, status TEXT NOT NULL, error TEXT, received_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)"
   );
+}
+
+async function ensureFollowGateTable(env: Env): Promise<void> {
+  await env.DB.exec(
+    "CREATE TABLE IF NOT EXISTS follow_prompts (commenter_id TEXT PRIMARY KEY, prompted_at INTEGER NOT NULL)"
+  );
+}
+
+function isFollowConfirmation(value: string): boolean {
+  return /\b(done|followed|follow\s*(kar|kr|kiya|kya))\b/i.test(value);
+}
+
+async function hasFollowPrompt(env: Env, commenterId: string): Promise<boolean> {
+  if (!commenterId) return false;
+  await ensureFollowGateTable(env);
+  const row = await env.DB.prepare("SELECT commenter_id FROM follow_prompts WHERE commenter_id = ?").bind(commenterId).first();
+  return Boolean(row);
+}
+
+async function rememberFollowPrompt(env: Env, commenterId: string): Promise<void> {
+  if (!commenterId) return;
+  await ensureFollowGateTable(env);
+  await env.DB.prepare(
+    "INSERT INTO follow_prompts (commenter_id, prompted_at) VALUES (?, ?) ON CONFLICT(commenter_id) DO UPDATE SET prompted_at = excluded.prompted_at"
+  ).bind(commenterId, Math.floor(Date.now() / 1000)).run();
 }
 
 async function recordActivity(env: Env, event: CommentEvent, status: string, replies?: { publicReply?: string; privateReply?: string }, error?: string): Promise<void> {
@@ -514,12 +541,13 @@ async function processEvent(env: Env, event: CommentEvent): Promise<void> {
   if (!(await claimEvent(env, event))) return;
   await recordActivity(env, event, "processing");
   const ownerId = event.ownerId || env.IG_USER_ID || "";
-  const config = await configForEvent(env, event.mediaId);
+  const resolved = await configForEvent(env, event.mediaId);
+  const config = resolved.config;
   const ignoreReason =
     (!ownerId && "missing_owner_id") ||
     (event.parentId && "reply_comment") ||
     (event.commenterId && event.commenterId === ownerId && "self_comment") ||
-    (event.mediaProductType && event.mediaProductType !== "REELS" && "not_reel") ||
+    (event.mediaProductType && !event.mediaProductType.toUpperCase().includes("REEL") && "not_reel") ||
     ((!config || !config.enabled) && "disabled") ||
     (config && !matchesKeywords(event.text, config.keywords) && "keyword_miss");
   if (ignoreReason) {
@@ -528,8 +556,14 @@ async function processEvent(env: Env, event: CommentEvent): Promise<void> {
     console.log(JSON.stringify({ level: "info", event: "comment_ignored", eventId: event.eventId, mediaId: event.mediaId, reason: ignoreReason }));
     return;
   }
-  const publicReply = render(config!.publicReply, event);
-  const privateReply = render(config!.privateReply, event);
+  const followConfirmed = resolved.isDefault && isFollowConfirmation(event.text) && await hasFollowPrompt(env, event.commenterId);
+  if (resolved.isDefault && !followConfirmed) await rememberFollowPrompt(env, event.commenterId);
+  const publicReply = resolved.isDefault && !followConfirmed
+    ? "Please follow @igstore_in, then comment DONE to receive the link."
+    : render(config!.publicReply, event);
+  const privateReply = resolved.isDefault && !followConfirmed
+    ? "Hi {{username}}, pehle @igstore_in ko follow karein. Follow karne ke baad isi Reel par DONE comment karein; phir hum IGStore.in link bhej denge."
+    : render(config!.privateReply, event);
   await recordActivity(env, event, "processing", { publicReply, privateReply });
   await runAction(env, event, "public_reply", () =>
     graphPost(env, `${event.commentId}/replies`, { message: publicReply })
