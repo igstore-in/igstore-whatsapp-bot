@@ -527,7 +527,7 @@ async function handleQuickReply(env: Env, event: QuickReplyEvent): Promise<void>
     await sendDirectMessage(
       env,
       event.senderId,
-      "Before I send the store access, please follow @igstore_in. Then tap the confirmation below.",
+      "Before I send the store access, please follow @igstore_in: https://www.instagram.com/igstore_in/\n\nThen tap the confirmation below.",
       [{ content_type: "text", title: "I'm following", payload: "IGSTORE_FOLLOW_CONFIRMED" }]
     );
     return;
