@@ -1,6 +1,3 @@
-Exit code: 0
-Wall time: 0.7 seconds
-Output:
 # Instagram Reel comment automation
 
 Cloudflare Worker that verifies Meta webhooks, queues Reel comment events, posts a public reply, and sends the comment-author private reply configured for that Reel.
