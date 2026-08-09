@@ -547,7 +547,6 @@ async function processEvent(env: Env, event: CommentEvent): Promise<void> {
     (!ownerId && "missing_owner_id") ||
     (event.parentId && "reply_comment") ||
     (event.commenterId && event.commenterId === ownerId && "self_comment") ||
-    (event.mediaProductType && !event.mediaProductType.toUpperCase().includes("REEL") && "not_reel") ||
     ((!config || !config.enabled) && "disabled") ||
     (config && !matchesKeywords(event.text, config.keywords) && "keyword_miss");
   if (ignoreReason) {
@@ -562,7 +561,7 @@ async function processEvent(env: Env, event: CommentEvent): Promise<void> {
     ? "Please follow @igstore_in, then comment DONE to receive the link."
     : render(config!.publicReply, event);
   const privateReply = resolved.isDefault && !followConfirmed
-    ? "Hi {{username}}, pehle @igstore_in ko follow karein. Follow karne ke baad isi Reel par DONE comment karein; phir hum IGStore.in link bhej denge."
+    ? "Hi {{username}}, pehle @igstore_in ko follow karein: https://www.instagram.com/igstore_in/\n\nFollow karne ke baad isi Reel par DONE comment karein; phir hum IGStore.in link bhej denge."
     : render(config!.privateReply, event);
   await recordActivity(env, event, "processing", { publicReply, privateReply });
   await runAction(env, event, "public_reply", () =>
