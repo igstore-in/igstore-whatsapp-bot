@@ -1,6 +1,3 @@
-Exit code: 0
-Wall time: 1 seconds
-Output:
 import { configFor, defaultConfig, type ReelConfig } from "./reel-config";
 import { adminHtml } from "./admin";
 
