@@ -1,6 +1,3 @@
-Exit code: 0
-Wall time: 1.2 seconds
-Output:
 export const adminHtml = `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>IG Store Â· Reel Replies</title>
 <style>
