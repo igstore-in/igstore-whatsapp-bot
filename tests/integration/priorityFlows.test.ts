@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  abandonedRecoveryButtonSuffix,
   allOrderVariants,
   buildAbandonedTemplatePayload,
   canonicalOrderStep,
@@ -89,14 +90,15 @@ describe("priority WhatsApp flows", () => {
         created_at: Date.now(),
       },
       {
-        templateName: "abandoned_checkout_offer",
-        language: "en_US",
+        templateName: "ig_abandoned_cart_1",
+        language: "en",
         fallbackImage: "https://cdn.example.com/fallback.jpg",
       },
     ) as any;
 
     expect(payload.to).toBe("919876543210");
-    expect(payload.template.name).toBe("abandoned_checkout_offer");
+    expect(payload.template.name).toBe("ig_abandoned_cart_1");
+    expect(payload.template.language.code).toBe("en");
     expect(payload.template.components[0].parameters[0].image.link).toContain(
       "name-plate.jpg",
     );
@@ -104,9 +106,48 @@ describe("priority WhatsApp flows", () => {
       "Asha",
       "Custom Name Plate",
       "₹799.00",
-      "No discount",
-      "https://igstore.in/checkouts/recover/example",
     ]);
+    expect(payload.template.components[2]).toMatchObject({
+      type: "button",
+      sub_type: "url",
+      index: "0",
+      parameters: [{ type: "text", text: "checkouts/recover/example" }],
+    });
+  });
+
+  it("matches approved offer-template variables and recovery button suffix", () => {
+    expect(
+      abandonedRecoveryButtonSuffix(
+        "https://igstore.in/checkouts/recover/cart-token?key=secret",
+      ),
+    ).toBe("checkouts/recover/cart-token?key=secret");
+
+    const payload = buildAbandonedTemplatePayload(
+      {
+        checkout_token: "checkout-2",
+        phone: "919876543210",
+        customer_name: "Asha",
+        product_title: "Name Plate",
+        product_image: null,
+        total_price: 499,
+        currency: "INR",
+        recovery_url: "https://igstore.in/checkouts/recover/cart-token",
+        consent: 1,
+        status: "pending",
+        due_at: Date.now(),
+        attempts: 1,
+        created_at: Date.now(),
+      },
+      {
+        templateName: "ig_abandoned_cart_5",
+        language: "en",
+        fallbackImage: "https://cdn.example.com/fallback.jpg",
+        offerCode: "CART5",
+      },
+    ) as any;
+
+    expect(payload.template.components[1].parameters.map((item: any) => item.text)).toHaveLength(4);
+    expect(payload.template.components[1].parameters[3].text).toBe("CART5");
   });
 
   it("spaces delayed abandoned reminders from the actual send time", () => {

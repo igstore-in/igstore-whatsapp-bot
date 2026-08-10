@@ -169,9 +169,10 @@ const ABANDONED_SEND_BATCH_SIZE = 100;
 const ABANDONED_PROCESSING_TIMEOUT_MINUTES = 30;
 const ABANDONED_OFFER_CODE = "CART5";
 const ABANDONED_FINAL_OFFER_CODE = "CART10";
-const DEFAULT_ABANDONED_TEMPLATE = "abandoned_checkout_reminder";
-const DEFAULT_ABANDONED_SECOND_TEMPLATE = "abandoned_checkout_5";
-const DEFAULT_ABANDONED_THIRD_TEMPLATE = "abandoned_checkout_10";
+const DEFAULT_ABANDONED_TEMPLATE = "ig_abandoned_cart_1";
+const DEFAULT_ABANDONED_SECOND_TEMPLATE = "ig_abandoned_cart_5";
+const DEFAULT_ABANDONED_THIRD_TEMPLATE = "ig_abandoned_cart_10";
+const DEFAULT_ABANDONED_TEMPLATE_LANGUAGE = "en";
 const DEFAULT_REENGAGEMENT_TEMPLATE = "customer_reengagement_30d";
 const DEFAULT_FEEDBACK_TEMPLATE = "delivery_feedback";
 const DEFAULT_ORDER_CONFIRMATION_TEMPLATE = "order_confirmation";
@@ -2574,13 +2575,20 @@ async function sendAbandonedCheckoutTemplate(
       : stage === 2
         ? `5% OFF Â· ${ABANDONED_OFFER_CODE}`
         : `10% OFF Â· ${ABANDONED_FINAL_OFFER_CODE}`;
+  const offerCode =
+    stage === 1
+      ? undefined
+      : offer.includes(ABANDONED_OFFER_CODE)
+        ? ABANDONED_OFFER_CODE
+        : ABANDONED_FINAL_OFFER_CODE;
   const payload = buildAbandonedTemplatePayload(checkout, {
     templateName,
     language:
-      env.ABANDONED_TEMPLATE_LANGUAGE?.trim() || DEFAULT_TEMPLATE_LANGUAGE,
+      env.ABANDONED_TEMPLATE_LANGUAGE?.trim() ||
+      DEFAULT_ABANDONED_TEMPLATE_LANGUAGE,
     fallbackImage:
       env.ABANDONED_FALLBACK_IMAGE_URL?.trim() || DEFAULT_FALLBACK_IMAGE,
-    offer,
+    offerCode,
   });
 
   const response = await fetch(endpoint, {
@@ -2608,11 +2616,19 @@ export function buildAbandonedTemplatePayload(
     templateName: string;
     language: string;
     fallbackImage: string;
-    offer?: string;
+    offerCode?: string;
   },
 ): Record<string, unknown> {
   const imageUrl = checkout.product_image || options.fallbackImage;
   const total = formatCheckoutAmount(checkout.total_price, checkout.currency);
+  const bodyParameters = [
+    { type: "text", text: checkout.customer_name.slice(0, 80) },
+    { type: "text", text: checkout.product_title.slice(0, 160) },
+    { type: "text", text: total },
+  ];
+  if (options.offerCode) {
+    bodyParameters.push({ type: "text", text: options.offerCode.slice(0, 40) });
+  }
   return {
     messaging_product: "whatsapp",
     recipient_type: "individual",
@@ -2628,17 +2644,29 @@ export function buildAbandonedTemplatePayload(
         },
         {
           type: "body",
+          parameters: bodyParameters,
+        },
+        {
+          type: "button",
+          sub_type: "url",
+          index: "0",
           parameters: [
-            { type: "text", text: checkout.customer_name.slice(0, 80) },
-            { type: "text", text: checkout.product_title.slice(0, 160) },
-            { type: "text", text: total },
-            { type: "text", text: String(options.offer ?? "No discount").slice(0, 120) },
-            { type: "text", text: checkout.recovery_url.slice(0, 1900) },
+            { type: "text", text: abandonedRecoveryButtonSuffix(checkout.recovery_url) },
           ],
         },
       ],
     },
   };
+}
+
+export function abandonedRecoveryButtonSuffix(recoveryUrl: string): string {
+  try {
+    const parsed = new URL(recoveryUrl);
+    const path = `${parsed.pathname}${parsed.search}${parsed.hash}`.replace(/^\/+/, "");
+    return path.slice(0, 1900);
+  } catch {
+    return recoveryUrl.replace(/^https?:\/\/[^/]+\/?/i, "").slice(0, 1900);
+  }
 }
 
 function formatCheckoutAmount(amount: number, currency: string): string {
