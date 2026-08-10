@@ -5,6 +5,7 @@ import {
   canonicalOrderStep,
   extractOrderNumber,
   isAngryMessage,
+  nextAbandonedReminderAt,
   parseIndianMobile,
   requiresHumanSupport,
 } from "../../src/index";
@@ -107,6 +108,12 @@ describe("priority WhatsApp flows", () => {
       "https://igstore.in/checkouts/recover/example",
     ]);
   });
+
+  it("spaces delayed abandoned reminders from the actual send time", () => {
+    const sentAt = Date.parse("2026-08-10T10:00:00.000Z");
+    expect(nextAbandonedReminderAt(1, sentAt)).toBe(sentAt + 30 * 60_000);
+    expect(nextAbandonedReminderAt(2, sentAt)).toBe(sentAt + 35 * 60_000);
+  });
 });
 
-
+
