@@ -162,6 +162,11 @@ const ABANDONED_MINIMUM_AMOUNT = 0;
 const ABANDONED_FIRST_DELAY_MINUTES = 15;
 const ABANDONED_SECOND_DELAY_MINUTES = 45;
 const ABANDONED_THIRD_DELAY_MINUTES = 80;
+const ABANDONED_SYNC_LOOKBACK_DAYS = 30;
+const ABANDONED_SYNC_PAGE_SIZE = 100;
+const ABANDONED_SYNC_MAX_PAGES = 25;
+const ABANDONED_SEND_BATCH_SIZE = 100;
+const ABANDONED_PROCESSING_TIMEOUT_MINUTES = 30;
 const ABANDONED_OFFER_CODE = "CART5";
 const ABANDONED_FINAL_OFFER_CODE = "CART10";
 const DEFAULT_ABANDONED_TEMPLATE = "abandoned_checkout_reminder";
@@ -1881,12 +1886,12 @@ async function upsertAbandonedCheckout(env: Bindings, payload: any): Promise<voi
       recovery_url = excluded.recovery_url,
       consent = excluded.consent,
       status = CASE
-        WHEN abandoned_checkouts.status IN ('recovered', 'sent', 'stopped')
+        WHEN abandoned_checkouts.status IN ('recovered', 'sent', 'stopped', 'processing')
           THEN abandoned_checkouts.status
         ELSE excluded.status
       END,
       skip_reason = CASE
-        WHEN abandoned_checkouts.status IN ('recovered', 'sent', 'stopped')
+        WHEN abandoned_checkouts.status IN ('recovered', 'sent', 'stopped', 'processing')
           THEN abandoned_checkouts.skip_reason
         ELSE excluded.skip_reason
       END,
@@ -2047,6 +2052,14 @@ async function processDueAbandonedCheckouts(env: Bindings): Promise<void> {
   await initializeDatabase(env);
 
   const now = Date.now();
+  await env.DB.prepare(`
+    UPDATE abandoned_checkouts
+    SET status = 'pending', updated_at = ?
+    WHERE status = 'processing' AND updated_at <= ?
+  `)
+    .bind(now, now - ABANDONED_PROCESSING_TIMEOUT_MINUTES * 60_000)
+    .run();
+
   const result = await env.DB.prepare(`
     SELECT
       checkout_token, phone, customer_name, product_title, product_image,
@@ -2055,12 +2068,21 @@ async function processDueAbandonedCheckouts(env: Bindings): Promise<void> {
     FROM abandoned_checkouts
     WHERE status = 'pending' AND due_at <= ?
     ORDER BY due_at ASC
-    LIMIT 25
+    LIMIT ?
   `)
-    .bind(now)
+    .bind(now, ABANDONED_SEND_BATCH_SIZE)
     .all<AbandonedCheckoutRow>();
 
   for (const checkout of result.results ?? []) {
+    const claimed = await env.DB.prepare(`
+      UPDATE abandoned_checkouts
+      SET status = 'processing', updated_at = ?
+      WHERE checkout_token = ? AND status = 'pending' AND due_at <= ?
+    `)
+      .bind(Date.now(), checkout.checkout_token, Date.now())
+      .run();
+    if (Number(claimed.meta?.changes ?? 0) === 0) continue;
+
     try {
       if (await isWhatsAppMarketingOptedOut(env, checkout.phone)) {
         await env.DB.prepare(`
@@ -2073,16 +2095,13 @@ async function processDueAbandonedCheckouts(env: Bindings): Promise<void> {
 
       const stage = Math.min(3, Number(checkout.attempts ?? 0) + 1);
       await sendAbandonedCheckoutTemplate(env, checkout, stage);
-      const nextDueAt =
-        stage === 1
-          ? checkout.created_at + ABANDONED_SECOND_DELAY_MINUTES * 60_000
-          : checkout.created_at + ABANDONED_THIRD_DELAY_MINUTES * 60_000;
+      const nextDueAt = nextAbandonedReminderAt(stage, Date.now());
       const nextStatus = stage >= 3 ? "sent" : "pending";
       await env.DB.prepare(`
         UPDATE abandoned_checkouts
         SET status = ?, attempts = ?, due_at = ?, sent_at = ?,
             updated_at = ?, last_error = NULL
-        WHERE checkout_token = ? AND status = 'pending'
+        WHERE checkout_token = ? AND status = 'processing'
       `)
         .bind(
           nextStatus,
@@ -2114,8 +2133,8 @@ async function processDueAbandonedCheckouts(env: Bindings): Promise<void> {
 
       await env.DB.prepare(`
         UPDATE abandoned_checkouts
-        SET due_at = ?, last_error = ?, updated_at = ?
-        WHERE checkout_token = ?
+        SET status = 'pending', due_at = ?, last_error = ?, updated_at = ?
+        WHERE checkout_token = ? AND status = 'processing'
       `)
         .bind(
           nextDueAt,
@@ -2143,7 +2162,8 @@ async function runAbandonedAutomation(
 async function abandonedCheckoutCounts(env: Bindings): Promise<Record<string, number>> {
   const row = await env.DB.prepare(`
     SELECT
-      COALESCE(SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END), 0) AS pending,
+      COALESCE(SUM(CASE WHEN status IN ('pending', 'processing') THEN 1 ELSE 0 END), 0) AS pending,
+      COALESCE(SUM(CASE WHEN status = 'processing' THEN 1 ELSE 0 END), 0) AS processing,
       COALESCE(SUM(CASE WHEN status = 'sent' THEN 1 ELSE 0 END), 0) AS sent,
       COALESCE(SUM(CASE WHEN status = 'recovered' THEN 1 ELSE 0 END), 0) AS recovered,
       COALESCE(SUM(CASE WHEN status = 'skipped' THEN 1 ELSE 0 END), 0) AS skipped,
@@ -2254,6 +2274,15 @@ async function ensureShopifyWebhookSubscriptions(
   }
 }
 
+export function nextAbandonedReminderAt(stage: number, sentAt: number): number {
+  if (stage <= 1) {
+    return sentAt +
+      (ABANDONED_SECOND_DELAY_MINUTES - ABANDONED_FIRST_DELAY_MINUTES) * 60_000;
+  }
+  return sentAt +
+    (ABANDONED_THIRD_DELAY_MINUTES - ABANDONED_SECOND_DELAY_MINUTES) * 60_000;
+}
+
 async function syncAbandonedCheckoutsFromShopify(env: Bindings): Promise<void> {
   const domain = shopifyAdminDomain(env);
   const token = await getShopifyAdminAccessToken(env);
@@ -2263,9 +2292,10 @@ async function syncAbandonedCheckoutsFromShopify(env: Bindings): Promise<void> {
   }
 
   const query = `
-    query AbandonedCheckouts($first: Int!, $query: String) {
+    query AbandonedCheckouts($first: Int!, $after: String, $query: String) {
       abandonedCheckouts(
         first: $first
+        after: $after
         query: $query
         sortKey: CREATED_AT
         reverse: true
@@ -2295,71 +2325,99 @@ async function syncAbandonedCheckoutsFromShopify(env: Bindings): Promise<void> {
           }
           customAttributes { key value }
         }
+        pageInfo { hasNextPage endCursor }
       }
     }
   `;
 
   try {
-    const response = await fetch(
-      `https://${domain}/admin/api/${shopifyAdminApiVersion(env)}/graphql.json`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-Shopify-Access-Token": token,
-        },
-        body: JSON.stringify({
-          query,
-          variables: {
-            first: 50,
-            query: `created_at:>=${new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString()}`,
-          },
-        }),
-      },
-    );
-    const payload = await response.json().catch(() => ({})) as {
-      data?: { abandonedCheckouts?: { nodes?: any[] } };
-      errors?: Array<{ message?: string }>;
-    };
-    if (!response.ok || payload.errors?.length) {
-      console.error("Abandoned checkout sync failed", {
-        status: response.status,
-        errors: payload.errors?.map((item) => item.message).filter(Boolean).slice(0, 3),
-      });
-      return;
-    }
+    let after: string | null = null;
+    const createdSince = new Date(
+      Date.now() - ABANDONED_SYNC_LOOKBACK_DAYS * 24 * 60 * 60 * 1000,
+    ).toISOString();
 
-    for (const checkout of payload.data?.abandonedCheckouts?.nodes ?? []) {
-      const phoneRecord = checkout?.customer?.defaultPhoneNumber;
-      const money = checkout?.totalPriceSet?.shopMoney;
-      const lineItems = checkout?.lineItems?.nodes ?? [];
-      await upsertAbandonedCheckout(env, {
-        token: checkout.id,
-        abandoned_checkout_url: checkout.abandonedCheckoutUrl,
-        completed_at: checkout.completedAt,
-        created_at: checkout.createdAt,
-        updated_at: checkout.updatedAt,
-        total_price: money?.amount,
-        currency: money?.currencyCode,
-        phone: phoneRecord?.phoneNumber ?? checkout?.shippingAddress?.phone,
-        buyer_accepts_sms_marketing:
-          String(phoneRecord?.marketingState ?? "").toUpperCase() === "SUBSCRIBED",
-        customer: { first_name: checkout?.customer?.firstName },
-        shipping_address: {
-          first_name: checkout?.shippingAddress?.firstName,
-          phone: checkout?.shippingAddress?.phone,
+    for (let page = 0; page < ABANDONED_SYNC_MAX_PAGES; page += 1) {
+      const response = await fetch(
+        `https://${domain}/admin/api/${shopifyAdminApiVersion(env)}/graphql.json`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Shopify-Access-Token": token,
+          },
+          body: JSON.stringify({
+            query,
+            variables: {
+              first: ABANDONED_SYNC_PAGE_SIZE,
+              after,
+              query: `created_at:>=${createdSince}`,
+            },
+          }),
         },
-        note_attributes: (checkout?.customAttributes ?? []).map((attribute: any) => ({
-          name: attribute?.key,
-          value: attribute?.value,
-        })),
-        line_items: lineItems.map((item: any) => ({
-          title: item?.title,
-          variant_title: item?.variantTitle,
-          quantity: item?.quantity,
-          image_url: item?.image?.url,
-        })),
-      });
+      );
+      const payload = await response.json().catch(() => ({})) as {
+        data?: {
+          abandonedCheckouts?: {
+            nodes?: any[];
+            pageInfo?: { hasNextPage?: boolean; endCursor?: string | null };
+          };
+        };
+        errors?: Array<{ message?: string }>;
+      };
+      if (!response.ok || payload.errors?.length) {
+        console.error("Abandoned checkout sync failed", {
+          status: response.status,
+          page: page + 1,
+          errors: payload.errors?.map((item) => item.message).filter(Boolean).slice(0, 3),
+        });
+        return;
+      }
+
+      const connection = payload.data?.abandonedCheckouts;
+      for (const checkout of connection?.nodes ?? []) {
+        const phoneRecord = checkout?.customer?.defaultPhoneNumber;
+        const money = checkout?.totalPriceSet?.shopMoney;
+        const lineItems = checkout?.lineItems?.nodes ?? [];
+        await upsertAbandonedCheckout(env, {
+          token: checkout.id,
+          abandoned_checkout_url: checkout.abandonedCheckoutUrl,
+          completed_at: checkout.completedAt,
+          created_at: checkout.createdAt,
+          updated_at: checkout.updatedAt,
+          total_price: money?.amount,
+          currency: money?.currencyCode,
+          phone: phoneRecord?.phoneNumber ?? checkout?.shippingAddress?.phone,
+          buyer_accepts_sms_marketing:
+            String(phoneRecord?.marketingState ?? "").toUpperCase() === "SUBSCRIBED",
+          customer: { first_name: checkout?.customer?.firstName },
+          shipping_address: {
+            first_name: checkout?.shippingAddress?.firstName,
+            phone: checkout?.shippingAddress?.phone,
+          },
+          note_attributes: (checkout?.customAttributes ?? []).map((attribute: any) => ({
+            name: attribute?.key,
+            value: attribute?.value,
+          })),
+          line_items: lineItems.map((item: any) => ({
+            title: item?.title,
+            variant_title: item?.variantTitle,
+            quantity: item?.quantity,
+            image_url: item?.image?.url,
+          })),
+        });
+      }
+
+      const pageInfo = connection?.pageInfo;
+      if (!pageInfo?.hasNextPage || !pageInfo.endCursor) break;
+      if (pageInfo.endCursor === after) {
+        console.error("Abandoned checkout sync stopped: Shopify cursor did not advance");
+        break;
+      }
+      after = pageInfo.endCursor;
+
+      if (page === ABANDONED_SYNC_MAX_PAGES - 1) {
+        console.warn("Abandoned checkout sync reached the safety page limit");
+      }
     }
   } catch (error) {
     console.error("Abandoned checkout sync exception", String(error));
