@@ -169,7 +169,7 @@ const ABANDONED_SEND_BATCH_SIZE = 10;
 const ABANDONED_PROCESSING_TIMEOUT_MINUTES = 30;
 const ABANDONED_OFFER_CODE = "CART5";
 const ABANDONED_FINAL_OFFER_CODE = "CART10";
-const DEFAULT_ABANDONED_TEMPLATE = "ig_abandoned_cart_1";
+const DEFAULT_ABANDONED_TEMPLATE = "ig_abandoned_checkout_reminder_1";
 const DEFAULT_ABANDONED_SECOND_TEMPLATE = "ig_abandoned_cart_5";
 const DEFAULT_ABANDONED_THIRD_TEMPLATE = "ig_abandoned_cart_10";
 const DEFAULT_ABANDONED_TEMPLATE_LANGUAGE = "en";
@@ -2153,18 +2153,13 @@ async function processDueAbandonedCheckouts(env: Bindings): Promise<void> {
         )
         .run();
 
-      const offer =
-        stage === 1
-          ? "No discount"
-          : stage === 2
-            ? `5% OFF with ${ABANDONED_OFFER_CODE}`
-            : `10% OFF with ${ABANDONED_FINAL_OFFER_CODE}`;
-
       await saveConversation(
         env,
         checkout.phone,
         "out",
-        `[image:${checkout.product_image || env.ABANDONED_FALLBACK_IMAGE_URL?.trim() || DEFAULT_FALLBACK_IMAGE}] Abandoned checkout reminder ${stage}/3\nProduct: ${checkout.product_title}\nCart: ${formatCheckoutAmount(checkout.total_price, checkout.currency)}\nOffer: ${offer}\nComplete order: ${checkout.recovery_url}`,
+        stage === 1
+          ? `🛒 Your order is still waiting!\n\nProduct: ${checkout.product_title}\n💰 Cart Value: ${formatCheckoutAmount(checkout.total_price, checkout.currency)}\n\nYou started checkout but didn’t complete your order.\n\nYour selected item is still waiting in your cart. Tap the button below to complete your purchase.\n\n📦 Pan India Delivery\n🔒 Secure Online Payment\n✨ Quality Products by IG Store\n\nNeed any help? Just reply to this message.\n\n— Team IG Store\n\n[Button: Complete Your Order]`
+          : `[image:${checkout.product_image || env.ABANDONED_FALLBACK_IMAGE_URL?.trim() || DEFAULT_FALLBACK_IMAGE}] Abandoned checkout reminder ${stage}/3\nProduct: ${checkout.product_title}\nCart: ${formatCheckoutAmount(checkout.total_price, checkout.currency)}\nOffer: ${stage === 2 ? `5% OFF with ${ABANDONED_OFFER_CODE}` : `10% OFF with ${ABANDONED_FINAL_OFFER_CODE}`}\n[Button: Complete Order]`,
         null,
       );
     } catch (error) {
@@ -2628,6 +2623,7 @@ async function sendAbandonedCheckoutTemplate(
       DEFAULT_ABANDONED_TEMPLATE_LANGUAGE,
     fallbackImage:
       env.ABANDONED_FALLBACK_IMAGE_URL?.trim() || DEFAULT_FALLBACK_IMAGE,
+    firstReminder: stage === 1,
     offerCode,
   });
 
@@ -2656,19 +2652,46 @@ export function buildAbandonedTemplatePayload(
     templateName: string;
     language: string;
     fallbackImage: string;
+    firstReminder?: boolean;
     offerCode?: string;
   },
 ): Record<string, unknown> {
   const imageUrl = checkout.product_image || options.fallbackImage;
   const total = formatCheckoutAmount(checkout.total_price, checkout.currency);
-  const bodyParameters = [
-    { type: "text", text: checkout.customer_name.slice(0, 80) },
-    { type: "text", text: checkout.product_title.slice(0, 160) },
-    { type: "text", text: total },
-  ];
+  const bodyParameters = options.firstReminder
+    ? [
+        { type: "text", text: checkout.product_title.slice(0, 160) },
+        { type: "text", text: total },
+      ]
+    : [
+        { type: "text", text: checkout.customer_name.slice(0, 80) },
+        { type: "text", text: checkout.product_title.slice(0, 160) },
+        { type: "text", text: total },
+      ];
   if (options.offerCode) {
     bodyParameters.push({ type: "text", text: options.offerCode.slice(0, 40) });
   }
+  const components: Array<Record<string, unknown>> = [];
+  if (!options.firstReminder) {
+    components.push({
+      type: "header",
+      parameters: [{ type: "image", image: { link: imageUrl } }],
+    });
+  }
+  components.push(
+    {
+      type: "body",
+      parameters: bodyParameters,
+    },
+    {
+      type: "button",
+      sub_type: "url",
+      index: "0",
+      parameters: [
+        { type: "text", text: abandonedRecoveryButtonSuffix(checkout.recovery_url) },
+      ],
+    },
+  );
   return {
     messaging_product: "whatsapp",
     recipient_type: "individual",
@@ -2677,24 +2700,7 @@ export function buildAbandonedTemplatePayload(
     template: {
       name: options.templateName,
       language: { code: options.language },
-      components: [
-        {
-          type: "header",
-          parameters: [{ type: "image", image: { link: imageUrl } }],
-        },
-        {
-          type: "body",
-          parameters: bodyParameters,
-        },
-        {
-          type: "button",
-          sub_type: "url",
-          index: "0",
-          parameters: [
-            { type: "text", text: abandonedRecoveryButtonSuffix(checkout.recovery_url) },
-          ],
-        },
-      ],
+      components,
     },
   };
 }
