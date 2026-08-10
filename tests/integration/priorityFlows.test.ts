@@ -90,21 +90,23 @@ describe("priority WhatsApp flows", () => {
         created_at: Date.now(),
       },
       {
-        templateName: "ig_abandoned_checkout_reminder_1",
+        templateName: "ig_abandoned_checkout_r1_image",
         language: "en",
         fallbackImage: "https://cdn.example.com/fallback.jpg",
-        firstReminder: true,
       },
     ) as any;
 
     expect(payload.to).toBe("919876543210");
-    expect(payload.template.name).toBe("ig_abandoned_checkout_reminder_1");
+    expect(payload.template.name).toBe("ig_abandoned_checkout_r1_image");
     expect(payload.template.language.code).toBe("en");
-    expect(payload.template.components[0].parameters.map((item: any) => item.text)).toEqual([
+    expect(payload.template.components[0].parameters[0].image.link).toContain(
+      "name-plate.jpg",
+    );
+    expect(payload.template.components[1].parameters.map((item: any) => item.text)).toEqual([
       "Custom Name Plate",
       "₹799.00",
     ]);
-    expect(payload.template.components[1]).toMatchObject({
+    expect(payload.template.components[2]).toMatchObject({
       type: "button",
       sub_type: "url",
       index: "0",
@@ -143,14 +145,20 @@ describe("priority WhatsApp flows", () => {
       },
     ) as any;
 
-    expect(payload.template.components[1].parameters.map((item: any) => item.text)).toHaveLength(4);
-    expect(payload.template.components[1].parameters[3].text).toBe("CART5");
+    expect(payload.template.components[1].parameters.map((item: any) => item.text)).toEqual([
+      "Name Plate",
+      "₹499.00",
+    ]);
+    expect(payload.template.components[2].parameters[0].text).toContain(
+      "discount/CART5?redirect=",
+    );
+    expect(payload.template.components[2].parameters[0].text).not.toContain("CART10");
   });
 
   it("spaces delayed abandoned reminders from the actual send time", () => {
     const sentAt = Date.parse("2026-08-10T10:00:00.000Z");
-    expect(nextAbandonedReminderAt(1, sentAt)).toBe(sentAt + 30 * 60_000);
-    expect(nextAbandonedReminderAt(2, sentAt)).toBe(sentAt + 35 * 60_000);
+    expect(nextAbandonedReminderAt(1, sentAt)).toBe(sentAt + 12 * 60 * 60_000);
+    expect(nextAbandonedReminderAt(2, sentAt)).toBe(sentAt + 24 * 60 * 60_000);
   });
 });
 
