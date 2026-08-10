@@ -159,9 +159,9 @@ const DEFAULT_SHOP_DOMAIN = "https://igstore.in";
 const SUPPORT_PHONE = "+91 95876 66693";
 const ABANDONED_DELAY_MINUTES = 45;
 const ABANDONED_MINIMUM_AMOUNT = 0;
-const ABANDONED_FIRST_DELAY_MINUTES = 15;
-const ABANDONED_SECOND_DELAY_MINUTES = 45;
-const ABANDONED_THIRD_DELAY_MINUTES = 80;
+const ABANDONED_FIRST_DELAY_MINUTES = 45;
+const ABANDONED_SECOND_DELAY_MINUTES = 45 + 12 * 60;
+const ABANDONED_THIRD_DELAY_MINUTES = 45 + 12 * 60 + 24 * 60;
 const ABANDONED_SYNC_LOOKBACK_DAYS = 30;
 const ABANDONED_SYNC_PAGE_SIZE = 100;
 const ABANDONED_SYNC_MAX_PAGES = 25;
@@ -169,9 +169,9 @@ const ABANDONED_SEND_BATCH_SIZE = 10;
 const ABANDONED_PROCESSING_TIMEOUT_MINUTES = 30;
 const ABANDONED_OFFER_CODE = "CART5";
 const ABANDONED_FINAL_OFFER_CODE = "CART10";
-const DEFAULT_ABANDONED_TEMPLATE = "ig_abandoned_checkout_reminder_1";
-const DEFAULT_ABANDONED_SECOND_TEMPLATE = "ig_abandoned_cart_5";
-const DEFAULT_ABANDONED_THIRD_TEMPLATE = "ig_abandoned_cart_10";
+const DEFAULT_ABANDONED_TEMPLATE = "ig_abandoned_checkout_r1_image";
+const DEFAULT_ABANDONED_SECOND_TEMPLATE = "ig_abandoned_checkout_r2_5off";
+const DEFAULT_ABANDONED_THIRD_TEMPLATE = "ig_abandoned_checkout_r3_10off";
 const DEFAULT_ABANDONED_TEMPLATE_LANGUAGE = "en";
 const DEFAULT_REENGAGEMENT_TEMPLATE = "customer_reengagement_30d";
 const DEFAULT_FEEDBACK_TEMPLATE = "delivery_feedback";
@@ -2157,9 +2157,11 @@ async function processDueAbandonedCheckouts(env: Bindings): Promise<void> {
         env,
         checkout.phone,
         "out",
-        stage === 1
-          ? `🛒 Your order is still waiting!\n\nProduct: ${checkout.product_title}\n💰 Cart Value: ${formatCheckoutAmount(checkout.total_price, checkout.currency)}\n\nYou started checkout but didn’t complete your order.\n\nYour selected item is still waiting in your cart. Tap the button below to complete your purchase.\n\n📦 Pan India Delivery\n🔒 Secure Online Payment\n✨ Quality Products by IG Store\n\nNeed any help? Just reply to this message.\n\n— Team IG Store\n\n[Button: Complete Your Order]`
-          : `[image:${checkout.product_image || env.ABANDONED_FALLBACK_IMAGE_URL?.trim() || DEFAULT_FALLBACK_IMAGE}] Abandoned checkout reminder ${stage}/3\nProduct: ${checkout.product_title}\nCart: ${formatCheckoutAmount(checkout.total_price, checkout.currency)}\nOffer: ${stage === 2 ? `5% OFF with ${ABANDONED_OFFER_CODE}` : `10% OFF with ${ABANDONED_FINAL_OFFER_CODE}`}\n[Button: Complete Order]`,
+        `[image:${checkout.product_image || env.ABANDONED_FALLBACK_IMAGE_URL?.trim() || DEFAULT_FALLBACK_IMAGE}] ${stage === 1
+          ? `🛒 Your order is still waiting!\n\nProduct: ${checkout.product_title}\nCart Value: ${formatCheckoutAmount(checkout.total_price, checkout.currency)}\n\nYou started checkout but didn’t complete your order.\n\nYour selected item is still waiting in your cart. Tap the button below to complete your purchase.\n\n📦 Pan India Delivery\n🔒 Secure Online Payment\n✨ Quality Products by IG Store\n\nNeed any help? Just reply to this message.\n\n— Team IG Store`
+          : stage === 2
+            ? `🛍️ You left something special behind!\n\nProduct: ${checkout.product_title}\nCart Value: ${formatCheckoutAmount(checkout.total_price, checkout.currency)}\n\n🎁 Special Offer: Get 5% OFF your order!\n\nYour checkout is still incomplete. Complete your order now and enjoy your special discount.\n\n📦 Pan India Delivery\n🔒 Secure Online Payment\n✨ Quality Products by IG Store\n\nNeed help? Just reply to this message.\n\n— Team IG Store`
+            : `⏳ Last chance to complete your order!\n\nProduct: ${checkout.product_title}\nCart Value: ${formatCheckoutAmount(checkout.total_price, checkout.currency)}\n\n🎉 Final Offer: Get 10% OFF your order!\n\nThis is your final reminder. Complete your purchase now and save 10% on your order.\n\nDon’t miss your special offer! 🎁\n\n📦 Pan India Delivery\n🔒 Secure Online Payment\n✨ Thank you for choosing IG Store\n\nNeed help? Just reply to this message.\n\n— Team IG Store`}\n\n[Button: Complete Your Order]`,
         null,
       );
     } catch (error) {
@@ -2623,7 +2625,6 @@ async function sendAbandonedCheckoutTemplate(
       DEFAULT_ABANDONED_TEMPLATE_LANGUAGE,
     fallbackImage:
       env.ABANDONED_FALLBACK_IMAGE_URL?.trim() || DEFAULT_FALLBACK_IMAGE,
-    firstReminder: stage === 1,
     offerCode,
   });
 
@@ -2652,46 +2653,15 @@ export function buildAbandonedTemplatePayload(
     templateName: string;
     language: string;
     fallbackImage: string;
-    firstReminder?: boolean;
     offerCode?: string;
   },
 ): Record<string, unknown> {
   const imageUrl = checkout.product_image || options.fallbackImage;
   const total = formatCheckoutAmount(checkout.total_price, checkout.currency);
-  const bodyParameters = options.firstReminder
-    ? [
-        { type: "text", text: checkout.product_title.slice(0, 160) },
-        { type: "text", text: total },
-      ]
-    : [
-        { type: "text", text: checkout.customer_name.slice(0, 80) },
-        { type: "text", text: checkout.product_title.slice(0, 160) },
-        { type: "text", text: total },
-      ];
-  if (options.offerCode) {
-    bodyParameters.push({ type: "text", text: options.offerCode.slice(0, 40) });
-  }
-  const components: Array<Record<string, unknown>> = [];
-  if (!options.firstReminder) {
-    components.push({
-      type: "header",
-      parameters: [{ type: "image", image: { link: imageUrl } }],
-    });
-  }
-  components.push(
-    {
-      type: "body",
-      parameters: bodyParameters,
-    },
-    {
-      type: "button",
-      sub_type: "url",
-      index: "0",
-      parameters: [
-        { type: "text", text: abandonedRecoveryButtonSuffix(checkout.recovery_url) },
-      ],
-    },
-  );
+  const bodyParameters = [
+    { type: "text", text: checkout.product_title.slice(0, 160) },
+    { type: "text", text: total },
+  ];
   return {
     messaging_product: "whatsapp",
     recipient_type: "individual",
@@ -2700,18 +2670,48 @@ export function buildAbandonedTemplatePayload(
     template: {
       name: options.templateName,
       language: { code: options.language },
-      components,
+      components: [
+        {
+          type: "header",
+          parameters: [{ type: "image", image: { link: imageUrl } }],
+        },
+        {
+          type: "body",
+          parameters: bodyParameters,
+        },
+        {
+          type: "button",
+          sub_type: "url",
+          index: "0",
+          parameters: [
+            {
+              type: "text",
+              text: abandonedRecoveryButtonSuffix(checkout.recovery_url, options.offerCode),
+            },
+          ],
+        },
+      ],
     },
   };
 }
 
-export function abandonedRecoveryButtonSuffix(recoveryUrl: string): string {
+export function abandonedRecoveryButtonSuffix(
+  recoveryUrl: string,
+  discountCode?: string,
+): string {
   try {
     const parsed = new URL(recoveryUrl);
     const path = `${parsed.pathname}${parsed.search}${parsed.hash}`.replace(/^\/+/, "");
+    if (discountCode) {
+      return `discount/${encodeURIComponent(discountCode)}?redirect=${encodeURIComponent(`/${path}`)}`.slice(0, 1900);
+    }
     return path.slice(0, 1900);
   } catch {
-    return recoveryUrl.replace(/^https?:\/\/[^/]+\/?/i, "").slice(0, 1900);
+    const path = recoveryUrl.replace(/^https?:\/\/[^/]+\/?/i, "");
+    if (discountCode) {
+      return `discount/${encodeURIComponent(discountCode)}?redirect=${encodeURIComponent(`/${path}`)}`.slice(0, 1900);
+    }
+    return path.slice(0, 1900);
   }
 }
 
