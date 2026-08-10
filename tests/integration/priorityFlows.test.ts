@@ -90,24 +90,21 @@ describe("priority WhatsApp flows", () => {
         created_at: Date.now(),
       },
       {
-        templateName: "ig_abandoned_cart_1",
+        templateName: "ig_abandoned_checkout_reminder_1",
         language: "en",
         fallbackImage: "https://cdn.example.com/fallback.jpg",
+        firstReminder: true,
       },
     ) as any;
 
     expect(payload.to).toBe("919876543210");
-    expect(payload.template.name).toBe("ig_abandoned_cart_1");
+    expect(payload.template.name).toBe("ig_abandoned_checkout_reminder_1");
     expect(payload.template.language.code).toBe("en");
-    expect(payload.template.components[0].parameters[0].image.link).toContain(
-      "name-plate.jpg",
-    );
-    expect(payload.template.components[1].parameters.map((item: any) => item.text)).toEqual([
-      "Asha",
+    expect(payload.template.components[0].parameters.map((item: any) => item.text)).toEqual([
       "Custom Name Plate",
       "₹799.00",
     ]);
-    expect(payload.template.components[2]).toMatchObject({
+    expect(payload.template.components[1]).toMatchObject({
       type: "button",
       sub_type: "url",
       index: "0",
