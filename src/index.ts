@@ -2079,6 +2079,27 @@ async function processDueAbandonedCheckouts(env: Bindings): Promise<void> {
     .bind(now, now - ABANDONED_PROCESSING_TIMEOUT_MINUTES * 60_000)
     .run();
 
+  await env.DB.prepare(`
+    UPDATE abandoned_checkouts
+    SET status = 'stopped', skip_reason = 'newer_checkout_exists', updated_at = ?
+    WHERE status = 'pending' AND phone != ''
+      AND EXISTS (
+        SELECT 1
+        FROM abandoned_checkouts newer
+        WHERE substr(newer.phone, -10) = substr(abandoned_checkouts.phone, -10)
+          AND newer.status IN ('pending', 'processing')
+          AND (
+            newer.created_at > abandoned_checkouts.created_at
+            OR (
+              newer.created_at = abandoned_checkouts.created_at
+              AND newer.checkout_token > abandoned_checkouts.checkout_token
+            )
+          )
+      )
+  `)
+    .bind(now)
+    .run();
+
   const result = await env.DB.prepare(`
     SELECT
       checkout_token, phone, customer_name, product_title, product_image,
