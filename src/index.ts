@@ -165,7 +165,7 @@ const ABANDONED_THIRD_DELAY_MINUTES = 80;
 const ABANDONED_SYNC_LOOKBACK_DAYS = 30;
 const ABANDONED_SYNC_PAGE_SIZE = 100;
 const ABANDONED_SYNC_MAX_PAGES = 25;
-const ABANDONED_SEND_BATCH_SIZE = 100;
+const ABANDONED_SEND_BATCH_SIZE = 10;
 const ABANDONED_PROCESSING_TIMEOUT_MINUTES = 30;
 const ABANDONED_OFFER_CODE = "CART5";
 const ABANDONED_FINAL_OFFER_CODE = "CART10";
@@ -334,7 +334,8 @@ app.get("/shopify/health", async (c) => {
       COALESCE(SUM(CASE WHEN status = 'sent' THEN 1 ELSE 0 END), 0) AS sent,
       COALESCE(SUM(CASE WHEN status = 'recovered' THEN 1 ELSE 0 END), 0) AS recovered,
       COALESCE(SUM(CASE WHEN status = 'skipped' THEN 1 ELSE 0 END), 0) AS skipped,
-      COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) AS failed
+      COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) AS failed,
+      COALESCE(SUM(attempts), 0) AS remindersAccepted
     FROM abandoned_checkouts
   `).first();
 
@@ -1816,7 +1817,9 @@ async function upsertAbandonedCheckout(env: Bindings, payload: any): Promise<voi
   const totalPrice = Number(payload?.total_price ?? payload?.subtotal_price ?? 0);
   const recoveryUrl = String(payload?.abandoned_checkout_url ?? "").trim();
   const phone = checkoutPhone(payload);
-  const consent = hasWhatsAppMarketingConsent(payload);
+  const consent =
+    hasWhatsAppMarketingConsent(payload) ||
+    (phone ? await hasStoredWhatsAppMarketingConsent(env, phone) : false);
   const customerName = checkoutCustomerName(payload);
   const productTitle = checkoutProductTitle(lineItems);
   const productImage =
@@ -2036,6 +2039,21 @@ async function markCheckoutRecovered(
   console.log("Checkout marked recovered:", checkoutToken);
 }
 
+async function hasStoredWhatsAppMarketingConsent(
+  env: Bindings,
+  phone: string,
+): Promise<boolean> {
+  const optedIn = await env.DB.prepare(`
+    SELECT phone
+    FROM whatsapp_marketing_opt_ins
+    WHERE substr(phone, -10) = substr(?, -10)
+    LIMIT 1
+  `)
+    .bind(phone)
+    .first();
+  return Boolean(optedIn);
+}
+
 async function markCheckoutsRecoveredByPhone(
   env: Bindings,
   phone: string | null,
@@ -2154,6 +2172,7 @@ async function runAbandonedAutomation(
   env: Bindings,
   forceWebhookSetup = false,
 ): Promise<void> {
+  await initializeDatabase(env);
   await ensureShopifyWebhookSubscriptions(env, forceWebhookSetup);
   await syncAbandonedCheckoutsFromShopify(env);
   await processDueAbandonedCheckouts(env);
@@ -3034,6 +3053,13 @@ async function initializeDatabase(env: Bindings): Promise<void> {
         status TEXT NOT NULL,
         error TEXT,
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )
+    `),
+    env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS whatsapp_marketing_opt_ins (
+        phone TEXT PRIMARY KEY,
+        source TEXT NOT NULL DEFAULT 'customer_consent',
+        consented_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
       )
     `),
     env.DB.prepare(`
@@ -4812,7 +4838,7 @@ function adminInboxHtml(): string {
       try{
         var data=await api('/admin/api/run-abandoned',{method:'POST'});
         var counts=data.counts||{};
-        showStatus('30-day sync complete Â· sent '+(counts.sent||0)+' Â· pending '+(counts.pending||0)+' Â· failed '+(counts.failed||0));
+        showStatus('30-day sync complete · reminders '+(counts.remindersAccepted||0)+' · active '+(counts.pending||0)+' · completed '+(counts.sent||0)+' · failed '+(counts.failed||0));
         await loadChats();
       }catch(error){showStatus(error.message)}
       finally{syncButton.disabled=false}
