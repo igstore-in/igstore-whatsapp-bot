@@ -153,6 +153,36 @@ describe("priority WhatsApp flows", () => {
       "discount/CART5?redirect=",
     );
     expect(payload.template.components[2].parameters[0].text).not.toContain("CART10");
+
+    const finalPayload = buildAbandonedTemplatePayload(
+      {
+        checkout_token: "checkout-3",
+        phone: "919876543210",
+        customer_name: "Asha",
+        product_title: "Name Plate",
+        product_image: null,
+        total_price: 499,
+        currency: "INR",
+        recovery_url: "https://igstore.in/checkouts/recover/cart-token",
+        consent: 1,
+        status: "pending",
+        due_at: Date.now(),
+        attempts: 2,
+        created_at: Date.now(),
+      },
+      {
+        templateName: "ig_abandoned_checkout_final_10off",
+        language: "en",
+        fallbackImage: "https://cdn.example.com/fallback.jpg",
+        offerCode: "CART10",
+      },
+    ) as any;
+
+    expect(finalPayload.template.name).toBe("ig_abandoned_checkout_final_10off");
+    expect(finalPayload.template.components[2].parameters[0].text).toContain(
+      "discount/CART10?redirect=",
+    );
+    expect(finalPayload.template.components[2].parameters[0].text).not.toContain("CART5");
   });
 
   it("spaces delayed abandoned reminders from the actual send time", () => {
