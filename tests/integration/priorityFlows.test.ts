@@ -90,20 +90,19 @@ describe("priority WhatsApp flows", () => {
         created_at: Date.now(),
       },
       {
-        templateName: "ig_abandoned_cart_1",
+        templateName: "ig_abandoned_checkout_r1_image",
         language: "en",
         fallbackImage: "https://cdn.example.com/fallback.jpg",
       },
     ) as any;
 
     expect(payload.to).toBe("919876543210");
-    expect(payload.template.name).toBe("ig_abandoned_cart_1");
+    expect(payload.template.name).toBe("ig_abandoned_checkout_r1_image");
     expect(payload.template.language.code).toBe("en");
     expect(payload.template.components[0].parameters[0].image.link).toContain(
       "name-plate.jpg",
     );
     expect(payload.template.components[1].parameters.map((item: any) => item.text)).toEqual([
-      "Asha",
       "Custom Name Plate",
       "₹799.00",
     ]);
@@ -146,14 +145,50 @@ describe("priority WhatsApp flows", () => {
       },
     ) as any;
 
-    expect(payload.template.components[1].parameters.map((item: any) => item.text)).toHaveLength(4);
-    expect(payload.template.components[1].parameters[3].text).toBe("CART5");
+    expect(payload.template.components[1].parameters.map((item: any) => item.text)).toEqual([
+      "Name Plate",
+      "₹499.00",
+    ]);
+    expect(payload.template.components[2].parameters[0].text).toContain(
+      "discount/CART5?redirect=",
+    );
+    expect(payload.template.components[2].parameters[0].text).not.toContain("CART10");
+
+    const finalPayload = buildAbandonedTemplatePayload(
+      {
+        checkout_token: "checkout-3",
+        phone: "919876543210",
+        customer_name: "Asha",
+        product_title: "Name Plate",
+        product_image: null,
+        total_price: 499,
+        currency: "INR",
+        recovery_url: "https://igstore.in/checkouts/recover/cart-token",
+        consent: 1,
+        status: "pending",
+        due_at: Date.now(),
+        attempts: 2,
+        created_at: Date.now(),
+      },
+      {
+        templateName: "ig_abandoned_checkout_final_10off",
+        language: "en",
+        fallbackImage: "https://cdn.example.com/fallback.jpg",
+        offerCode: "CART10",
+      },
+    ) as any;
+
+    expect(finalPayload.template.name).toBe("ig_abandoned_checkout_final_10off");
+    expect(finalPayload.template.components[2].parameters[0].text).toContain(
+      "discount/CART10?redirect=",
+    );
+    expect(finalPayload.template.components[2].parameters[0].text).not.toContain("CART5");
   });
 
   it("spaces delayed abandoned reminders from the actual send time", () => {
     const sentAt = Date.parse("2026-08-10T10:00:00.000Z");
-    expect(nextAbandonedReminderAt(1, sentAt)).toBe(sentAt + 30 * 60_000);
-    expect(nextAbandonedReminderAt(2, sentAt)).toBe(sentAt + 35 * 60_000);
+    expect(nextAbandonedReminderAt(1, sentAt)).toBe(sentAt + 12 * 60 * 60_000);
+    expect(nextAbandonedReminderAt(2, sentAt)).toBe(sentAt + 24 * 60 * 60_000);
   });
 });
 
