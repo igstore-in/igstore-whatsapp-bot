@@ -162,7 +162,8 @@ const ABANDONED_MINIMUM_AMOUNT = 0;
 const ABANDONED_FIRST_DELAY_MINUTES = 45;
 const ABANDONED_SECOND_DELAY_MINUTES = 45 + 12 * 60;
 const ABANDONED_THIRD_DELAY_MINUTES = 45 + 12 * 60 + 24 * 60;
-const ABANDONED_SYNC_LOOKBACK_DAYS = 30;
+export const ABANDONED_NEW_ONLY_SINCE = "2026-08-12T04:50:18.793Z";
+const ABANDONED_NEW_ONLY_SINCE_MS = Date.parse(ABANDONED_NEW_ONLY_SINCE);
 const ABANDONED_SYNC_PAGE_SIZE = 100;
 const ABANDONED_SYNC_MAX_PAGES = 25;
 const ABANDONED_SEND_BATCH_SIZE = 10;
@@ -334,6 +335,7 @@ app.get("/shopify/health", async (c) => {
       COALESCE(SUM(CASE WHEN status = 'sent' THEN 1 ELSE 0 END), 0) AS sent,
       COALESCE(SUM(CASE WHEN status = 'recovered' THEN 1 ELSE 0 END), 0) AS recovered,
       COALESCE(SUM(CASE WHEN status = 'skipped' THEN 1 ELSE 0 END), 0) AS skipped,
+      COALESCE(SUM(CASE WHEN status = 'stopped' THEN 1 ELSE 0 END), 0) AS stopped,
       COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) AS failed,
       COALESCE(SUM(attempts), 0) AS remindersAccepted
     FROM abandoned_checkouts
@@ -347,7 +349,8 @@ app.get("/shopify/health", async (c) => {
       { afterMinutes: ABANDONED_SECOND_DELAY_MINUTES, discount: "5%", code: ABANDONED_OFFER_CODE },
       { afterMinutes: ABANDONED_THIRD_DELAY_MINUTES, discount: "10%", code: ABANDONED_FINAL_OFFER_CODE },
     ],
-    syncWindowDays: 30,
+    syncMode: "new-checkouts-only",
+    syncSince: ABANDONED_NEW_ONLY_SINCE,
     stopKeywordEnabled: true,
     minimumAmount: ABANDONED_MINIMUM_AMOUNT,
     counts: counts ?? {},
@@ -483,7 +486,8 @@ app.get("/admin/api/messages", async (c) => {
   }
 
   const result = await c.env.DB.prepare(`
-    SELECT id, phone, direction, body, whatsapp_message_id, created_at
+    SELECT id, phone, direction, body, whatsapp_message_id,
+           delivery_status, status_updated_at, created_at
     FROM conversations
     WHERE phone = ?
     ORDER BY id ASC
@@ -535,8 +539,8 @@ app.post("/admin/api/send", async (c) => {
   }
 
   try {
-    await sendText(c.env, phone, body);
-    await saveConversation(c.env, phone, "out", body, null);
+    const messageId = await sendText(c.env, phone, body);
+    await saveConversation(c.env, phone, "out", body, messageId);
     return c.json({ ok: true });
   } catch (error) {
     console.error("Admin reply failed:", error);
@@ -621,15 +625,20 @@ app.onError((error, c) => {
 async function processWebhook(env: Bindings, payload: any): Promise<void> {
   try {
     const messages = extractMessages(payload);
-    if (messages.length === 0) {
-      console.log("Webhook contains no incoming customer messages");
-      return;
-    }
+    const statuses = extractMessageStatuses(payload);
 
     await initializeDatabase(env);
 
+    for (const status of statuses) {
+      await updateOutboundMessageStatus(env, status);
+    }
+
     for (const message of messages) {
       await processMessage(env, message);
+    }
+
+    if (messages.length === 0 && statuses.length === 0) {
+      console.log("Webhook contains no customer messages or delivery statuses");
     }
   } catch (error) {
     console.error("Webhook processing error:", error);
@@ -858,6 +867,65 @@ async function processMessage(env: Bindings, message: any): Promise<void> {
   }
 
   await replyAndLog(env, from, noProductFoundMessage(user.language, text));
+}
+
+export type WhatsAppMessageStatus = {
+  id: string;
+  status: "sent" | "delivered" | "read" | "failed";
+  recipientId: string;
+  timestamp: number | null;
+};
+
+export function extractMessageStatuses(payload: any): WhatsAppMessageStatus[] {
+  const statuses: WhatsAppMessageStatus[] = [];
+  for (const entry of Array.isArray(payload?.entry) ? payload.entry : []) {
+    for (const change of Array.isArray(entry?.changes) ? entry.changes : []) {
+      for (const item of Array.isArray(change?.value?.statuses) ? change.value.statuses : []) {
+        const id = String(item?.id ?? "").trim();
+        const status = String(item?.status ?? "").toLowerCase();
+        if (!id || !["sent", "delivered", "read", "failed"].includes(status)) continue;
+        const timestamp = Number(item?.timestamp);
+        statuses.push({
+          id,
+          status: status as WhatsAppMessageStatus["status"],
+          recipientId: String(item?.recipient_id ?? ""),
+          timestamp: Number.isFinite(timestamp) ? timestamp : null,
+        });
+      }
+    }
+  }
+  return statuses;
+}
+
+export function deliveryStatusRank(status: string): number {
+  return ({ pending: 0, sent: 1, delivered: 2, read: 3, failed: 4 } as Record<string, number>)[status] ?? 0;
+}
+
+async function updateOutboundMessageStatus(
+  env: Bindings,
+  update: WhatsAppMessageStatus,
+): Promise<void> {
+  const existing = await env.DB.prepare(`
+    SELECT status FROM whatsapp_message_statuses WHERE message_id = ? LIMIT 1
+  `).bind(update.id).first<{ status: string }>();
+  if (existing && deliveryStatusRank(update.status) < deliveryStatusRank(existing.status)) return;
+
+  await env.DB.prepare(`
+    INSERT INTO whatsapp_message_statuses (
+      message_id, phone, status, status_timestamp, updated_at
+    ) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+    ON CONFLICT(message_id) DO UPDATE SET
+      phone = CASE WHEN excluded.phone != '' THEN excluded.phone ELSE whatsapp_message_statuses.phone END,
+      status = excluded.status,
+      status_timestamp = excluded.status_timestamp,
+      updated_at = CURRENT_TIMESTAMP
+  `).bind(update.id, update.recipientId, update.status, update.timestamp).run();
+
+  await env.DB.prepare(`
+    UPDATE conversations
+    SET delivery_status = ?, status_updated_at = CURRENT_TIMESTAMP
+    WHERE whatsapp_message_id = ? AND direction = 'out'
+  `).bind(update.status, update.id).run();
 }
 
 function getIncomingContent(message: any):
@@ -1380,13 +1448,13 @@ async function sendProductCards(
 
     if (env.WHATSAPP_CATALOG_ID?.trim() && product.catalogue_id?.trim()) {
       try {
-        await sendCatalogueProduct(env, phone, product.catalogue_id, caption);
+        const messageId = await sendCatalogueProduct(env, phone, product.catalogue_id, caption);
         await saveConversation(
           env,
           phone,
           "out",
           `[catalogue:${product.catalogue_id}] ${caption}`,
-          null,
+          messageId,
         );
         continue;
       } catch (error) {
@@ -1396,8 +1464,8 @@ async function sendProductCards(
 
     if (imageUrl) {
       try {
-        await sendImage(env, phone, imageUrl, caption);
-        await saveConversation(env, phone, "out", `[image:${imageUrl}] ${caption}`, null);
+        const messageId = await sendImage(env, phone, imageUrl, caption);
+        await saveConversation(env, phone, "out", `[image:${imageUrl}] ${caption}`, messageId);
         continue;
       } catch (error) {
         console.error("Product image send failed; falling back to text:", error);
@@ -1832,9 +1900,8 @@ async function upsertAbandonedCheckout(env: Bindings, payload: any): Promise<voi
   const checkoutActivityAt = Date.parse(
     String(payload?.created_at ?? payload?.updated_at ?? ""),
   );
-  const dueAt =
-    (Number.isFinite(checkoutActivityAt) ? checkoutActivityAt : now) +
-    ABANDONED_FIRST_DELAY_MINUTES * 60_000;
+  const activityAt = Number.isFinite(checkoutActivityAt) ? checkoutActivityAt : now;
+  const dueAt = activityAt + ABANDONED_FIRST_DELAY_MINUTES * 60_000;
 
   const alreadyRecovered = await env.DB.prepare(
     "SELECT checkout_token FROM recovered_checkout_tokens WHERE checkout_token = ? LIMIT 1",
@@ -1856,9 +1923,15 @@ async function upsertAbandonedCheckout(env: Bindings, payload: any): Promise<voi
   let status = "pending";
   let skipReason: string | null = null;
 
-  if (!phone) {
+  if (activityAt < ABANDONED_NEW_ONLY_SINCE_MS) {
+    status = "stopped";
+    skipReason = "legacy_checkout_before_new_only_cutoff";
+  } else if (!phone) {
     status = "skipped";
     skipReason = "phone_missing";
+  } else if (await hasCompletedOrderForPhone(env, phone)) {
+    status = "recovered";
+    skipReason = "customer_already_purchased";
   } else if (!consent) {
     status = "skipped";
     skipReason = "whatsapp_marketing_opt_in_missing";
@@ -1918,7 +1991,7 @@ async function upsertAbandonedCheckout(env: Bindings, payload: any): Promise<voi
       status,
       skipReason,
       dueAt,
-      now,
+      activityAt,
       now,
     )
     .run();
@@ -2054,6 +2127,18 @@ async function hasStoredWhatsAppMarketingConsent(
   return Boolean(optedIn);
 }
 
+async function hasCompletedOrderForPhone(env: Bindings, phone: string): Promise<boolean> {
+  const order = await env.DB.prepare(`
+    SELECT order_id
+    FROM shopify_orders
+    WHERE substr(phone, -10) = substr(?, -10)
+      AND cancelled_at = ''
+      AND lower(replace(financial_status, ' ', '_')) IN ('paid', 'authorized', 'partially_paid')
+    LIMIT 1
+  `).bind(phone).first();
+  return Boolean(order);
+}
+
 async function markCheckoutsRecoveredByPhone(
   env: Bindings,
   phone: string | null,
@@ -2063,7 +2148,8 @@ async function markCheckoutsRecoveredByPhone(
   await env.DB.prepare(`
     UPDATE abandoned_checkouts
     SET status = 'recovered', recovered_at = ?, updated_at = ?
-    WHERE substr(phone, -10) = substr(?, -10) AND status = 'pending'
+    WHERE substr(phone, -10) = substr(?, -10)
+      AND status IN ('pending', 'processing')
   `).bind(now, now, phone).run();
 }
 
@@ -2071,6 +2157,12 @@ async function processDueAbandonedCheckouts(env: Bindings): Promise<void> {
   await initializeDatabase(env);
 
   const now = Date.now();
+  await env.DB.prepare(`
+    UPDATE abandoned_checkouts
+    SET status = 'stopped', skip_reason = 'legacy_checkout_before_new_only_cutoff', updated_at = ?
+    WHERE status IN ('pending', 'processing') AND created_at < ?
+  `).bind(now, ABANDONED_NEW_ONLY_SINCE_MS).run();
+
   await env.DB.prepare(`
     UPDATE abandoned_checkouts
     SET status = 'pending', updated_at = ?
@@ -2124,6 +2216,17 @@ async function processDueAbandonedCheckouts(env: Bindings): Promise<void> {
     if (Number(claimed.meta?.changes ?? 0) === 0) continue;
 
     try {
+      if (await hasCompletedOrderForPhone(env, checkout.phone)) {
+        const recoveredAt = Date.now();
+        await env.DB.prepare(`
+          UPDATE abandoned_checkouts
+          SET status = 'recovered', skip_reason = 'customer_already_purchased',
+              recovered_at = ?, updated_at = ?
+          WHERE checkout_token = ?
+        `).bind(recoveredAt, recoveredAt, checkout.checkout_token).run();
+        continue;
+      }
+
       if (await isWhatsAppMarketingOptedOut(env, checkout.phone)) {
         await env.DB.prepare(`
           UPDATE abandoned_checkouts
@@ -2134,7 +2237,7 @@ async function processDueAbandonedCheckouts(env: Bindings): Promise<void> {
       }
 
       const stage = Math.min(3, Number(checkout.attempts ?? 0) + 1);
-      await sendAbandonedCheckoutTemplate(env, checkout, stage);
+      const messageId = await sendAbandonedCheckoutTemplate(env, checkout, stage);
       const nextDueAt = nextAbandonedReminderAt(stage, Date.now());
       const nextStatus = stage >= 3 ? "sent" : "pending";
       await env.DB.prepare(`
@@ -2162,7 +2265,7 @@ async function processDueAbandonedCheckouts(env: Bindings): Promise<void> {
           : stage === 2
             ? `🛍️ You left something special behind!\n\nProduct: ${checkout.product_title}\nCart Value: ${formatCheckoutAmount(checkout.total_price, checkout.currency)}\n\n🎁 Special Offer: Get 5% OFF your order!\n\nYour checkout is still incomplete. Complete your order now and enjoy your special discount.\n\n📦 Pan India Delivery\n🔒 Secure Online Payment\n✨ Quality Products by IG Store\n\nNeed help? Just reply to this message.\n\n— Team IG Store`
             : `⏳ Last chance to complete your order!\n\nProduct: ${checkout.product_title}\nCart Value: ${formatCheckoutAmount(checkout.total_price, checkout.currency)}\n\n🎉 Final Offer: Get 10% OFF your order!\n\nThis is your final reminder. Complete your purchase now and save 10% on your order.\n\nDon’t miss your special offer! 🎁\n\n📦 Pan India Delivery\n🔒 Secure Online Payment\n✨ Thank you for choosing IG Store\n\nNeed help? Just reply to this message.\n\n— Team IG Store`}\n\n[Button: Complete Your Order]`,
-        null,
+        messageId,
       );
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -2370,9 +2473,7 @@ async function syncAbandonedCheckoutsFromShopify(env: Bindings): Promise<void> {
 
   try {
     let after: string | null = null;
-    const createdSince = new Date(
-      Date.now() - ABANDONED_SYNC_LOOKBACK_DAYS * 24 * 60 * 60 * 1000,
-    ).toISOString();
+    const createdSince = ABANDONED_NEW_ONLY_SINCE;
 
     for (let page = 0; page < ABANDONED_SYNC_MAX_PAGES; page += 1) {
       const response = await fetch(
@@ -2589,7 +2690,7 @@ async function sendAbandonedCheckoutTemplate(
   env: Bindings,
   checkout: AbandonedCheckoutRow,
   stage: number,
-): Promise<void> {
+): Promise<string | null> {
   if (!checkout.phone || !checkout.recovery_url || checkout.consent !== 1) {
     throw new Error("Checkout is missing phone, recovery URL or consent");
   }
@@ -2645,6 +2746,7 @@ async function sendAbandonedCheckoutTemplate(
       `WhatsApp template failed (${response.status}): ${responseBody.slice(0, 500)}`,
     );
   }
+  return extractWhatsAppMessageId(responseBody);
 }
 
 export function buildAbandonedTemplatePayload(
@@ -2728,7 +2830,7 @@ async function sendCatalogueProduct(
   to: string,
   catalogueId: string,
   bodyText: string,
-): Promise<void> {
+): Promise<string | null> {
   const graphVersion = env.META_GRAPH_VERSION?.trim() || "v25.0";
   const endpoint = `https://graph.facebook.com/${graphVersion}/${env.WHATSAPP_PHONE_NUMBER_ID}/messages`;
   const catalogId = env.WHATSAPP_CATALOG_ID?.trim();
@@ -2761,6 +2863,7 @@ async function sendCatalogueProduct(
   if (!response.ok) {
     throw new Error(`WhatsApp catalogue product request failed with status ${response.status}`);
   }
+  return extractWhatsAppMessageId(responseBody);
 }
 
 async function sendWhatsAppTemplate(
@@ -2768,7 +2871,7 @@ async function sendWhatsAppTemplate(
   to: string,
   templateName: string,
   bodyParameters: string[],
-): Promise<void> {
+): Promise<string | null> {
   const graphVersion = env.META_GRAPH_VERSION?.trim() || "v25.0";
   const endpoint = `https://graph.facebook.com/${graphVersion}/${env.WHATSAPP_PHONE_NUMBER_ID}/messages`;
   const response = await fetch(endpoint, {
@@ -2807,9 +2910,20 @@ async function sendWhatsAppTemplate(
       `WhatsApp template failed (${response.status}): ${responseBody.slice(0, 500)}`,
     );
   }
+  return extractWhatsAppMessageId(responseBody);
 }
 
-async function sendText(env: Bindings, to: string, body: string): Promise<void> {
+export function extractWhatsAppMessageId(responseBody: string): string | null {
+  try {
+    const payload = JSON.parse(responseBody);
+    const id = String(payload?.messages?.[0]?.id ?? "").trim();
+    return id || null;
+  } catch {
+    return null;
+  }
+}
+
+async function sendText(env: Bindings, to: string, body: string): Promise<string | null> {
   const graphVersion = env.META_GRAPH_VERSION?.trim() || "v25.0";
   const endpoint = `https://graph.facebook.com/${graphVersion}/${env.WHATSAPP_PHONE_NUMBER_ID}/messages`;
 
@@ -2837,6 +2951,7 @@ async function sendText(env: Bindings, to: string, body: string): Promise<void> 
   if (!response.ok) {
     throw new Error(`WhatsApp API request failed with status ${response.status}`);
   }
+  return extractWhatsAppMessageId(responseBody);
 }
 
 async function sendImage(
@@ -2844,7 +2959,7 @@ async function sendImage(
   to: string,
   imageUrl: string,
   caption: string,
-): Promise<void> {
+): Promise<string | null> {
   const graphVersion = env.META_GRAPH_VERSION?.trim() || "v25.0";
   const endpoint = `https://graph.facebook.com/${graphVersion}/${env.WHATSAPP_PHONE_NUMBER_ID}/messages`;
 
@@ -2872,11 +2987,12 @@ async function sendImage(
   if (!response.ok) {
     throw new Error(`WhatsApp image request failed with status ${response.status}`);
   }
+  return extractWhatsAppMessageId(responseBody);
 }
 
 async function replyAndLog(env: Bindings, phone: string, body: string): Promise<void> {
-  await sendText(env, phone, body);
-  await saveConversation(env, phone, "out", body, null);
+  const messageId = await sendText(env, phone, body);
+  await saveConversation(env, phone, "out", body, messageId);
 }
 
 async function initializeDatabase(env: Bindings): Promise<void> {
@@ -2909,6 +3025,8 @@ async function initializeDatabase(env: Bindings): Promise<void> {
         direction TEXT NOT NULL,
         body TEXT NOT NULL,
         whatsapp_message_id TEXT,
+        delivery_status TEXT NOT NULL DEFAULT '',
+        status_updated_at TEXT,
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
       )
     `),
@@ -2988,6 +3106,15 @@ async function initializeDatabase(env: Bindings): Promise<void> {
       CREATE TABLE IF NOT EXISTS order_tracking_context (
         phone TEXT PRIMARY KEY,
         pending INTEGER NOT NULL DEFAULT 1,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )
+    `),
+    env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS whatsapp_message_statuses (
+        message_id TEXT PRIMARY KEY,
+        phone TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'sent',
+        status_timestamp INTEGER,
         updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
       )
     `),
@@ -3108,6 +3235,8 @@ async function initializeDatabase(env: Bindings): Promise<void> {
   for (const statement of [
     "ALTER TABLE order_flow_context ADD COLUMN mobile_phone TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE whatsapp_order_drafts ADD COLUMN mobile_phone TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE conversations ADD COLUMN delivery_status TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE conversations ADD COLUMN status_updated_at TEXT",
   ]) {
     try {
       await env.DB.prepare(statement).run();
@@ -4357,8 +4486,8 @@ async function sendTemplateOrWindowMessage(
   fallbackMessage: string,
 ): Promise<void> {
   try {
-    await sendWhatsAppTemplate(env, phone, templateName, parameters);
-    await saveConversation(env, phone, "out", fallbackMessage, null);
+    const messageId = await sendWhatsAppTemplate(env, phone, templateName, parameters);
+    await saveConversation(env, phone, "out", fallbackMessage, messageId);
   } catch (error) {
     if (!(await hasOpenCustomerServiceWindow(env, phone))) throw error;
     await replyAndLog(env, phone, fallbackMessage);
@@ -4725,7 +4854,7 @@ function adminInboxHtml(): string {
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <title>IG Store WhatsApp Inbox</title>
   <style>
-    *{box-sizing:border-box}body{margin:0;font-family:Arial,Helvetica,sans-serif;background:#dfe5e7;color:#111827;height:100vh;overflow:hidden}
+    *{box-sizing:border-box}body{margin:0;font-family:"Segoe UI",Arial,Helvetica,sans-serif;background:#0b141a;color:#111827;height:100vh;overflow:hidden}
     .app{height:100vh;height:100dvh;min-height:0;max-width:1500px;margin:auto;background:#fff;display:grid;grid-template-columns:360px 1fr;box-shadow:0 0 30px rgba(0,0,0,.14)}
     .sidebar{border-right:1px solid #d8dde1;display:flex;flex-direction:column;min-width:0;min-height:0;background:#fff}
     .brand{height:68px;padding:12px 16px;background:#f0f2f5;display:flex;align-items:center;gap:12px;border-bottom:1px solid #d8dde1}
@@ -4739,7 +4868,7 @@ function adminInboxHtml(): string {
     .main{display:flex;flex-direction:column;min-width:0;min-height:0;background:#efeae2}.topbar{height:68px;flex-shrink:0;background:#f0f2f5;border-bottom:1px solid #d8dde1;padding:10px 16px;display:flex;align-items:center;gap:12px}.topbar .details{min-width:0}.topbar strong{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.topbar small{color:#667781}.back{display:none;border:0;background:transparent;font-size:24px;cursor:pointer}
     .placeholder{flex:1;display:grid;place-items:center;text-align:center;color:#667781;padding:30px}.placeholder h2{color:#41525d;font-weight:400}
     .messages{flex:1;min-height:0;overflow-y:auto;overscroll-behavior:contain;touch-action:pan-y;-webkit-overflow-scrolling:touch;padding:22px 7%;background-color:#efeae2;background-image:radial-gradient(rgba(17,24,39,.035) 1px,transparent 1px);background-size:18px 18px;display:none}
-    .row{display:flex;margin:4px 0}.row.in{justify-content:flex-start}.row.out{justify-content:flex-end}.bubble{max-width:min(70%,720px);padding:8px 10px 6px;border-radius:8px;box-shadow:0 1px 1px rgba(0,0,0,.09);white-space:pre-wrap;overflow-wrap:anywhere;font-size:14px;line-height:1.42}.in .bubble{background:#fff;border-top-left-radius:2px}.out .bubble{background:#d9fdd3;border-top-right-radius:2px}.msg-time{display:block;text-align:right;color:#667781;font-size:10px;margin-top:4px}
+    .row{display:flex;margin:4px 0}.row.in{justify-content:flex-start}.row.out{justify-content:flex-end}.bubble{max-width:min(70%,720px);padding:7px 9px 5px;border-radius:8px;box-shadow:0 1px 1px rgba(0,0,0,.12);white-space:pre-wrap;overflow-wrap:anywhere;font-size:14px;line-height:1.42}.in .bubble{background:#fff;border-top-left-radius:2px}.out .bubble{background:#d9fdd3;border-top-right-radius:2px}.msg-meta{display:flex;justify-content:flex-end;align-items:center;gap:4px;color:#667781;font-size:10px;margin-top:3px}.ticks{font-size:15px;line-height:10px;letter-spacing:-5px;padding-right:5px;color:#8696a0}.ticks.read{color:#53bdeb}.ticks.failed{color:#e5484d;letter-spacing:0;padding-right:0}
     .composer{display:none;flex-shrink:0;position:sticky;bottom:0;z-index:2;background:#f0f2f5;padding:10px 14px;padding-bottom:max(10px,env(safe-area-inset-bottom));gap:10px;align-items:flex-end}.composer textarea{flex:1;resize:none;max-height:120px;min-height:42px;border:0;border-radius:9px;padding:11px 13px;font:inherit;outline:none}.composer button{height:42px;border:0;border-radius:50%;width:42px;background:#00a884;color:#fff;font-size:18px;cursor:pointer}.composer button:disabled{opacity:.5}.status{position:fixed;right:18px;bottom:18px;background:#111827;color:#fff;padding:10px 14px;border-radius:8px;font-size:13px;display:none;z-index:10}
     @media(max-width:760px){.app{display:block}.sidebar,.main{height:100vh}.main{display:none}.app.open-chat .sidebar{display:none}.app.open-chat .main{display:flex}.back{display:block}.messages{padding:18px 10px}.bubble{max-width:88%}}
   </style>
@@ -4747,7 +4876,7 @@ function adminInboxHtml(): string {
 <body>
   <div class="app" id="app">
     <aside class="sidebar">
-      <div class="brand"><div class="logo">IG</div><div><strong>IG Store Inbox</strong><small>WhatsApp conversations</small></div><div class="sync-form"><button id="syncButton" type="button">Sync 30d</button></div></div>
+      <div class="brand"><div class="logo">IG</div><div><strong>IG Store WhatsApp</strong><small>New checkouts only</small></div><div class="sync-form"><button id="syncButton" type="button">Sync new</button></div></div>
       <div class="search"><input id="search" placeholder="Search name or phone"></div>
       <div class="chat-list" id="chatList"><div class="empty">Loading conversationsâ€¦</div></div>
     </aside>
@@ -4847,7 +4976,9 @@ function adminInboxHtml(): string {
           var bubble=document.createElement('div');bubble.className='bubble';var body=document.createElement('div');
           var raw=String(message.body || '');var imageMatch=raw.match(/^\\[image:(https:\\/\\/[^\\]]+)\\]\\s*/);
           if(imageMatch){var image=document.createElement('img');image.src=imageMatch[1];image.alt='Product image';image.loading='lazy';image.style.cssText='display:block;max-width:100%;max-height:320px;border-radius:7px;margin-bottom:7px;object-fit:cover';bubble.appendChild(image);raw=raw.slice(imageMatch[0].length)}
-          body.textContent=raw;var time=document.createElement('span');time.className='msg-time';time.textContent=formatMessageTime(message.created_at)+(message.direction==='out'?'  Sent':'');bubble.appendChild(body);bubble.appendChild(time);row.appendChild(bubble);messages.appendChild(row);
+          body.textContent=raw;var meta=document.createElement('span');meta.className='msg-meta';var time=document.createElement('span');time.textContent=formatMessageTime(message.created_at);meta.appendChild(time);
+          if(message.direction==='out'){var status=String(message.delivery_status||'sent');var ticks=document.createElement('span');ticks.className='ticks '+status;ticks.title=status.charAt(0).toUpperCase()+status.slice(1);ticks.textContent=status==='failed'?'!':(status==='sent'?'✓':'✓✓');meta.appendChild(ticks)}
+          bubble.appendChild(body);bubble.appendChild(meta);row.appendChild(bubble);messages.appendChild(row);
         });
         if(scroll) messages.scrollTop=messages.scrollHeight;
       }catch(error){showStatus(error.message)}finally{loadingMessages=false}
@@ -4865,7 +4996,7 @@ function adminInboxHtml(): string {
       try{
         var data=await api('/admin/api/run-abandoned',{method:'POST'});
         var counts=data.counts||{};
-        showStatus('30-day sync complete · reminders '+(counts.remindersAccepted||0)+' · active '+(counts.pending||0)+' · completed '+(counts.sent||0)+' · failed '+(counts.failed||0));
+        showStatus('New checkouts synced · reminders '+(counts.remindersAccepted||0)+' · active '+(counts.pending||0)+' · completed '+(counts.sent||0)+' · failed '+(counts.failed||0));
         await loadChats();
       }catch(error){showStatus(error.message)}
       finally{syncButton.disabled=false}
@@ -4885,11 +5016,23 @@ async function saveConversation(
   messageId: string | null,
 ): Promise<void> {
   try {
+    const savedStatus = messageId && direction === "out"
+      ? await env.DB.prepare(
+          "SELECT status FROM whatsapp_message_statuses WHERE message_id = ? LIMIT 1",
+        ).bind(messageId).first<{ status: string }>()
+      : null;
     await env.DB.prepare(
-      `INSERT INTO conversations (phone, direction, body, whatsapp_message_id)
-       VALUES (?, ?, ?, ?)`,
+      `INSERT INTO conversations (
+         phone, direction, body, whatsapp_message_id, delivery_status, status_updated_at
+       ) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
     )
-      .bind(phone, direction, body.slice(0, 4000), messageId)
+      .bind(
+        phone,
+        direction,
+        body.slice(0, 4000),
+        messageId,
+        direction === "out" ? savedStatus?.status || "sent" : "received",
+      )
       .run();
   } catch (error) {
     console.error("Failed to save conversation:", error);

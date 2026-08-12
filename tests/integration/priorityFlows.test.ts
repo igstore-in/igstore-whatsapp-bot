@@ -1,9 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
+  ABANDONED_NEW_ONLY_SINCE,
   abandonedRecoveryButtonSuffix,
   allOrderVariants,
   buildAbandonedTemplatePayload,
   canonicalOrderStep,
+  deliveryStatusRank,
+  extractMessageStatuses,
+  extractWhatsAppMessageId,
   extractOrderNumber,
   isAngryMessage,
   nextAbandonedReminderAt,
@@ -189,6 +193,44 @@ describe("priority WhatsApp flows", () => {
     const sentAt = Date.parse("2026-08-10T10:00:00.000Z");
     expect(nextAbandonedReminderAt(1, sentAt)).toBe(sentAt + 12 * 60 * 60_000);
     expect(nextAbandonedReminderAt(2, sentAt)).toBe(sentAt + 24 * 60 * 60_000);
+  });
+
+  it("starts abandoned checkout targeting from the new-only rollout cutoff", () => {
+    expect(ABANDONED_NEW_ONLY_SINCE).toBe("2026-08-12T04:50:18.793Z");
+    expect(Date.parse(ABANDONED_NEW_ONLY_SINCE)).toBeGreaterThan(
+      Date.parse("2026-08-12T00:00:00.000Z"),
+    );
+  });
+
+  it("extracts Meta read receipts and preserves WhatsApp status order", () => {
+    const statuses = extractMessageStatuses({
+      entry: [{
+        changes: [{
+          value: {
+            statuses: [{
+              id: "wamid.read-1",
+              status: "read",
+              recipient_id: "919876543210",
+              timestamp: "1786500000",
+            }],
+          },
+        }],
+      }],
+    });
+    expect(statuses).toEqual([{
+      id: "wamid.read-1",
+      status: "read",
+      recipientId: "919876543210",
+      timestamp: 1786500000,
+    }]);
+    expect(deliveryStatusRank("read")).toBeGreaterThan(deliveryStatusRank("delivered"));
+    expect(deliveryStatusRank("delivered")).toBeGreaterThan(deliveryStatusRank("sent"));
+  });
+
+  it("stores the outgoing Meta message id used by blue ticks", () => {
+    expect(extractWhatsAppMessageId(JSON.stringify({ messages: [{ id: "wamid.123" }] })))
+      .toBe("wamid.123");
+    expect(extractWhatsAppMessageId("not-json")).toBeNull();
   });
 });
 
