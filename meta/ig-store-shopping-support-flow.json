@@ -1,0 +1,484 @@
+{
+  "version": "7.3",
+  "routing_model": {
+    "IG_STORE_HELP": [
+      "IG_STORE_SHOP",
+      "IG_STORE_CUSTOM",
+      "IG_STORE_TRACK",
+      "IG_STORE_PAYMENT",
+      "IG_STORE_SUPPORT",
+      "IG_STORE_FEEDBACK"
+    ],
+    "IG_STORE_SHOP": [],
+    "IG_STORE_CUSTOM": [],
+    "IG_STORE_TRACK": [],
+    "IG_STORE_PAYMENT": [],
+    "IG_STORE_SUPPORT": [],
+    "IG_STORE_FEEDBACK": []
+  },
+  "screens": [
+    {
+      "id": "IG_STORE_HELP",
+      "title": "IG Store",
+      "data": {},
+      "layout": {
+        "type": "SingleColumnLayout",
+        "children": [
+          {
+            "type": "NavigationList",
+            "name": "ig_store_services",
+            "list-items": [
+              {
+                "id": "shop",
+                "main-content": {
+                  "title": "Shop gifts",
+                  "description": "Verified products"
+                },
+                "on-click-action": {
+                  "name": "navigate",
+                  "next": {
+                    "type": "screen",
+                    "name": "IG_STORE_SHOP"
+                  },
+                  "payload": {}
+                }
+              },
+              {
+                "id": "custom",
+                "main-content": {
+                  "title": "Create a custom order",
+                  "description": "Personalised items"
+                },
+                "on-click-action": {
+                  "name": "navigate",
+                  "next": {
+                    "type": "screen",
+                    "name": "IG_STORE_CUSTOM"
+                  },
+                  "payload": {}
+                }
+              },
+              {
+                "id": "track",
+                "main-content": {
+                  "title": "Track my order",
+                  "description": "Live Shopify status"
+                },
+                "on-click-action": {
+                  "name": "navigate",
+                  "next": {
+                    "type": "screen",
+                    "name": "IG_STORE_TRACK"
+                  },
+                  "payload": {}
+                }
+              },
+              {
+                "id": "payment",
+                "main-content": {
+                  "title": "Payment help",
+                  "description": "Checkout assistance"
+                },
+                "on-click-action": {
+                  "name": "navigate",
+                  "next": {
+                    "type": "screen",
+                    "name": "IG_STORE_PAYMENT"
+                  },
+                  "payload": {}
+                }
+              },
+              {
+                "id": "support",
+                "main-content": {
+                  "title": "Customer support",
+                  "description": "Returns or damage"
+                },
+                "on-click-action": {
+                  "name": "navigate",
+                  "next": {
+                    "type": "screen",
+                    "name": "IG_STORE_SUPPORT"
+                  },
+                  "payload": {}
+                }
+              },
+              {
+                "id": "feedback",
+                "main-content": {
+                  "title": "Share feedback",
+                  "description": "Your experience"
+                },
+                "on-click-action": {
+                  "name": "navigate",
+                  "next": {
+                    "type": "screen",
+                    "name": "IG_STORE_FEEDBACK"
+                  },
+                  "payload": {}
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "IG_STORE_SHOP",
+      "title": "Shop gifts",
+      "terminal": true,
+      "success": true,
+      "data": {},
+      "layout": {
+        "type": "SingleColumnLayout",
+        "children": [
+          {
+            "type": "Form",
+            "name": "shop_request",
+            "children": [
+              {
+                "type": "Dropdown",
+                "label": "Product category",
+                "name": "product_category",
+                "required": true,
+                "data-source": [
+                  { "id": "name_plate", "title": "Name plates" },
+                  { "id": "photo_gift", "title": "Photo gifts" },
+                  { "id": "personalised", "title": "Personalised gifts" },
+                  { "id": "home_decor", "title": "Home decor" },
+                  { "id": "occasion_gift", "title": "Gifts by occasion" },
+                  { "id": "other", "title": "Other" }
+                ]
+              },
+              {
+                "type": "TextInput",
+                "label": "Your name",
+                "name": "customer_name",
+                "input-type": "text",
+                "required": true
+              },
+              {
+                "type": "TextInput",
+                "label": "Mobile number",
+                "name": "mobile_number",
+                "input-type": "phone",
+                "required": true
+              },
+              {
+                "type": "TextArea",
+                "label": "What are you looking for?",
+                "name": "details",
+                "required": true
+              }
+            ]
+          },
+          {
+            "type": "Footer",
+            "label": "Show products",
+            "on-click-action": {
+              "name": "complete",
+              "payload": {
+                "screen": "IG_STORE_SHOP",
+                "request_type": "shop",
+                "product_category": "${form.product_category}",
+                "customer_name": "${form.customer_name}",
+                "mobile_number": "${form.mobile_number}",
+                "details": "${form.details}"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "id": "IG_STORE_CUSTOM",
+      "title": "Custom order",
+      "terminal": true,
+      "success": true,
+      "data": {},
+      "layout": {
+        "type": "SingleColumnLayout",
+        "children": [
+          {
+            "type": "Form",
+            "name": "custom_request",
+            "children": [
+              {
+                "type": "Dropdown",
+                "label": "Product category",
+                "name": "product_category",
+                "required": true,
+                "data-source": [
+                  { "id": "name_plate", "title": "Name plate" },
+                  { "id": "photo_gift", "title": "Photo gift" },
+                  { "id": "personalised", "title": "Personalised gift" },
+                  { "id": "home_decor", "title": "Neon sign / home decor" },
+                  { "id": "occasion_gift", "title": "Occasion gift" },
+                  { "id": "other", "title": "Other custom item" }
+                ]
+              },
+              {
+                "type": "TextInput",
+                "label": "Your name",
+                "name": "customer_name",
+                "input-type": "text",
+                "required": true
+              },
+              {
+                "type": "TextInput",
+                "label": "Mobile number",
+                "name": "mobile_number",
+                "input-type": "phone",
+                "required": true
+              },
+              {
+                "type": "TextArea",
+                "label": "Name, text, size, colour and required date",
+                "name": "details",
+                "required": true
+              }
+            ]
+          },
+          {
+            "type": "Footer",
+            "label": "Find custom options",
+            "on-click-action": {
+              "name": "complete",
+              "payload": {
+                "screen": "IG_STORE_CUSTOM",
+                "request_type": "custom",
+                "product_category": "${form.product_category}",
+                "customer_name": "${form.customer_name}",
+                "mobile_number": "${form.mobile_number}",
+                "details": "${form.details}"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "id": "IG_STORE_TRACK",
+      "title": "Track order",
+      "terminal": true,
+      "success": true,
+      "data": {},
+      "layout": {
+        "type": "SingleColumnLayout",
+        "children": [
+          {
+            "type": "Form",
+            "name": "track_request",
+            "children": [
+              {
+                "type": "TextHeading",
+                "text": "Check your live order status"
+              },
+              {
+                "type": "TextInput",
+                "label": "Order number",
+                "name": "order_number",
+                "input-type": "text",
+                "required": true
+              },
+              {
+                "type": "TextInput",
+                "label": "Mobile number used for the order",
+                "name": "mobile_number",
+                "input-type": "phone",
+                "required": true
+              }
+            ]
+          },
+          {
+            "type": "Footer",
+            "label": "Track order",
+            "on-click-action": {
+              "name": "complete",
+              "payload": {
+                "screen": "IG_STORE_TRACK",
+                "request_type": "track",
+                "mobile_number": "${form.mobile_number}",
+                "order_number": "${form.order_number}"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "id": "IG_STORE_PAYMENT",
+      "title": "Payment help",
+      "terminal": true,
+      "success": true,
+      "data": {},
+      "layout": {
+        "type": "SingleColumnLayout",
+        "children": [
+          {
+            "type": "Form",
+            "name": "payment_request",
+            "children": [
+              {
+                "type": "TextBody",
+                "text": "Never share an OTP, UPI PIN, CVV or card PIN."
+              },
+              {
+                "type": "TextInput",
+                "label": "Your name",
+                "name": "customer_name",
+                "input-type": "text",
+                "required": true
+              },
+              {
+                "type": "TextInput",
+                "label": "Mobile number",
+                "name": "mobile_number",
+                "input-type": "phone",
+                "required": true
+              },
+              {
+                "type": "TextInput",
+                "label": "Order number",
+                "name": "order_number",
+                "input-type": "text"
+              },
+              {
+                "type": "TextArea",
+                "label": "What happened?",
+                "name": "details",
+                "required": true
+              }
+            ]
+          },
+          {
+            "type": "Footer",
+            "label": "Request payment help",
+            "on-click-action": {
+              "name": "complete",
+              "payload": {
+                "screen": "IG_STORE_PAYMENT",
+                "request_type": "payment",
+                "customer_name": "${form.customer_name}",
+                "mobile_number": "${form.mobile_number}",
+                "order_number": "${form.order_number}",
+                "details": "${form.details}"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "id": "IG_STORE_SUPPORT",
+      "title": "Customer support",
+      "terminal": true,
+      "success": true,
+      "data": {},
+      "layout": {
+        "type": "SingleColumnLayout",
+        "children": [
+          {
+            "type": "Form",
+            "name": "support_request",
+            "children": [
+              {
+                "type": "TextInput",
+                "label": "Your name",
+                "name": "customer_name",
+                "input-type": "text",
+                "required": true
+              },
+              {
+                "type": "TextInput",
+                "label": "Mobile number",
+                "name": "mobile_number",
+                "input-type": "phone",
+                "required": true
+              },
+              {
+                "type": "TextInput",
+                "label": "Order number",
+                "name": "order_number",
+                "input-type": "text"
+              },
+              {
+                "type": "TextArea",
+                "label": "Describe the issue",
+                "name": "details",
+                "required": true
+              }
+            ]
+          },
+          {
+            "type": "Footer",
+            "label": "Send to support",
+            "on-click-action": {
+              "name": "complete",
+              "payload": {
+                "screen": "IG_STORE_SUPPORT",
+                "request_type": "support",
+                "customer_name": "${form.customer_name}",
+                "mobile_number": "${form.mobile_number}",
+                "order_number": "${form.order_number}",
+                "details": "${form.details}"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "id": "IG_STORE_FEEDBACK",
+      "title": "Share feedback",
+      "terminal": true,
+      "success": true,
+      "data": {},
+      "layout": {
+        "type": "SingleColumnLayout",
+        "children": [
+          {
+            "type": "Form",
+            "name": "feedback_request",
+            "children": [
+              {
+                "type": "TextInput",
+                "label": "Your name",
+                "name": "customer_name",
+                "input-type": "text",
+                "required": true
+              },
+              {
+                "type": "TextInput",
+                "label": "Mobile number",
+                "name": "mobile_number",
+                "input-type": "phone",
+                "required": true
+              },
+              {
+                "type": "TextArea",
+                "label": "Your feedback",
+                "name": "details",
+                "required": true
+              }
+            ]
+          },
+          {
+            "type": "Footer",
+            "label": "Send feedback",
+            "on-click-action": {
+              "name": "complete",
+              "payload": {
+                "screen": "IG_STORE_FEEDBACK",
+                "request_type": "feedback",
+                "customer_name": "${form.customer_name}",
+                "mobile_number": "${form.mobile_number}",
+                "details": "${form.details}"
+              }
+            }
+          }
+        ]
+      }
+    }
+  ]
+}
