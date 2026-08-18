@@ -1,5 +1,28 @@
 # OpenAPI Template
 
+## IG Store WhatsApp Flow integration
+
+Published Meta Flow `IG Store Shopping & Support` (`1068611185637149`) submits
+an `interactive.nfm_reply` message to the existing Meta webhook at `/webhook`.
+The Worker now:
+
+- sends an **Open IG Store** Flow button after greetings, menu requests, and language changes;
+- validates and deduplicates the WhatsApp message;
+- saves the complete request in D1 table `whatsapp_flow_submissions`;
+- searches verified Shopify products for shopping and custom-gift requests;
+- performs live Shopify Admin order lookup for tracking requests;
+- creates a human-support queue item for payment, return, damage, or missing-product cases;
+- sends the result back to the same customer through WhatsApp Cloud API.
+
+Apply D1 migrations before deployment:
+
+```bash
+npx wrangler d1 migrations apply DB --remote
+npx wrangler deploy
+```
+
+`GET /health` reports the active Flow ID and whether the Shopify integration is configured.
+
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/cloudflare/templates/tree/main/chanfana-openapi-template)
 
 ![OpenAPI Template Preview](https://imagedelivery.net/wSMYJvS3Xw-n339CbDyDIA/91076b39-1f5b-46f6-7f14-536a6f183000/public)

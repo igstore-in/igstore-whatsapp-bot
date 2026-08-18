@@ -135,6 +135,16 @@ type AbandonedCheckoutRow = {
   created_at: number;
 };
 
+export type WhatsAppFlowSubmission = {
+  requestType: "shop" | "custom" | "track" | "payment" | "support" | "feedback";
+  productCategory: string;
+  customerName: string;
+  mobileNumber: string;
+  orderNumber: string;
+  details: string;
+  flowToken: string;
+};
+
 type ShopifyLineItem = {
   title?: string;
   presentment_title?: string;
@@ -182,6 +192,8 @@ const DEFAULT_TEMPLATE_LANGUAGE = "en_US";
 const DEFAULT_FALLBACK_IMAGE =
   "https://cdn.shopify.com/s/files/1/0600/1383/8379/collections/best-sellers-collection.jpg?v=1783692206";
 const DEFAULT_OPENAI_MODEL = "gpt-5-mini";
+export const IG_STORE_FLOW_ID = "1068611185637149";
+const IG_STORE_FLOW_SCREEN = "IG_STORE_HELP";
 
 const MASTER_SYSTEM_PROMPT = `
 à¤†à¤ª IG Store à¤•à¥‡ official WhatsApp Shopping Assistant à¤¹à¥ˆà¤‚à¥¤ à¤†à¤ªà¤•à¤¾ à¤¨à¤¾à¤® IG Store Gift Assistant à¤¹à¥ˆà¥¤
@@ -249,6 +261,19 @@ app.get("/health", (c) =>
     ok: true,
     service: "igstore-whatsapp-bot",
     shop: shopDomain(c.env),
+    whatsappFlow: {
+      id: IG_STORE_FLOW_ID,
+      screen: IG_STORE_FLOW_SCREEN,
+      responseHandler: "interactive.nfm_reply",
+    },
+    integrations: {
+      database: true,
+      shopify: Boolean(
+        shopifyAdminDomain(c.env) &&
+          (c.env.SHOPIFY_ADMIN_ACCESS_TOKEN?.trim() ||
+            (c.env.SHOPIFY_CLIENT_ID?.trim() && c.env.SHOPIFY_CLIENT_SECRET?.trim())),
+      ),
+    },
   }),
 );
 
@@ -694,6 +719,17 @@ async function processMessage(env: Bindings, message: any): Promise<void> {
   const user = await getOrCreateUser(env, from);
   await saveConversation(env, from, "in", incoming.logText, messageId);
 
+  if (incoming.kind === "flow") {
+    await handleWhatsAppFlowSubmission(
+      env,
+      from,
+      messageId,
+      user.language,
+      incoming.submission,
+    );
+    return;
+  }
+
   if (incoming.kind === "unsupported") {
     await replyAndLog(env, from, unsupportedMessage(user.language));
     return;
@@ -752,16 +788,21 @@ async function processMessage(env: Bindings, message: any): Promise<void> {
     await setUserLanguage(env, from, selectedLanguage);
     await replyAndLog(env, from, languageConfirmation(selectedLanguage));
     await replyAndLog(env, from, mainMenu(selectedLanguage));
+    await sendFlowLauncherAndLog(env, from);
     return;
   }
 
   if (user.isNew) {
     await replyAndLog(env, from, welcomeMessage(user.language));
-    if (isGreeting(normalized)) return;
+    if (isGreeting(normalized)) {
+      await sendFlowLauncherAndLog(env, from);
+      return;
+    }
   }
 
   if (isGreeting(normalized) || isMenuCommand(normalized)) {
     await replyAndLog(env, from, mainMenu(user.language));
+    await sendFlowLauncherAndLog(env, from);
     return;
   }
 
@@ -930,6 +971,7 @@ async function updateOutboundMessageStatus(
 
 function getIncomingContent(message: any):
   | { kind: "text"; text: string; logText: string }
+  | { kind: "flow"; submission: WhatsAppFlowSubmission; logText: string }
   | { kind: "media"; mediaType: string; logText: string }
   | { kind: "unsupported"; logText: string } {
   if (message?.type === "text" && typeof message?.text?.body === "string") {
@@ -938,6 +980,15 @@ function getIncomingContent(message: any):
 
   if (message?.type === "button" && typeof message?.button?.text === "string") {
     return { kind: "text", text: message.button.text, logText: message.button.text };
+  }
+
+  const flowSubmission = extractWhatsAppFlowSubmission(message);
+  if (flowSubmission) {
+    return {
+      kind: "flow",
+      submission: flowSubmission,
+      logText: formatFlowSubmissionForInbox(flowSubmission),
+    };
   }
 
   const interactiveText =
@@ -959,6 +1010,66 @@ function getIncomingContent(message: any):
   }
 
   return { kind: "unsupported", logText: `[${String(message?.type ?? "unknown")}]` };
+}
+
+function safeFlowField(value: unknown, maxLength = 600): string {
+  if (typeof value !== "string" && typeof value !== "number") return "";
+  return String(value).trim().slice(0, maxLength);
+}
+
+export function extractWhatsAppFlowSubmission(
+  message: any,
+): WhatsAppFlowSubmission | null {
+  if (message?.type !== "interactive") return null;
+  const reply = message?.interactive?.nfm_reply;
+  if (!reply) return null;
+
+  let response: Record<string, unknown>;
+  try {
+    response = typeof reply.response_json === "string"
+      ? JSON.parse(reply.response_json)
+      : reply.response_json;
+  } catch {
+    return null;
+  }
+  if (!response || typeof response !== "object" || Array.isArray(response)) return null;
+
+  const screen = safeFlowField(response.screen, 80);
+  if (screen && screen !== IG_STORE_FLOW_SCREEN) return null;
+
+  const requestType = safeFlowField(response.request_type, 40);
+  if (!["shop", "custom", "track", "payment", "support", "feedback"].includes(requestType)) {
+    return null;
+  }
+
+  return {
+    requestType: requestType as WhatsAppFlowSubmission["requestType"],
+    productCategory: safeFlowField(response.product_category, 80),
+    customerName: safeFlowField(response.customer_name, 120),
+    mobileNumber: safeFlowField(response.mobile_number, 30),
+    orderNumber: safeFlowField(response.order_number, 40),
+    details: safeFlowField(response.details),
+    flowToken: safeFlowField(response.flow_token, 200),
+  };
+}
+
+function formatFlowSubmissionForInbox(submission: WhatsAppFlowSubmission): string {
+  const labels: Record<WhatsAppFlowSubmission["requestType"], string> = {
+    shop: "Shop / product enquiry",
+    custom: "Personalised gift order",
+    track: "Track my order",
+    payment: "Payment / checkout help",
+    support: "Return, damage or support",
+    feedback: "Feedback",
+  };
+  return [
+    `WhatsApp Flow: ${labels[submission.requestType]}`,
+    submission.productCategory ? `Product category: ${submission.productCategory}` : "",
+    submission.customerName ? `Name: ${submission.customerName}` : "",
+    submission.mobileNumber ? `Mobile: ${submission.mobileNumber}` : "",
+    submission.orderNumber ? `Order: ${submission.orderNumber}` : "",
+    submission.details ? `Requirement: ${submission.details}` : "",
+  ].filter(Boolean).join("\n");
 }
 
 function normalize(value: string): string {
@@ -1007,6 +1118,134 @@ async function isWhatsAppMarketingOptedOut(
     "SELECT phone FROM whatsapp_marketing_opt_outs WHERE phone = ? LIMIT 1",
   ).bind(phone).first();
   return Boolean(row);
+}
+
+const FLOW_PRODUCT_QUERIES: Record<string, string> = {
+  name_plate: "name plate",
+  photo_gift: "photo gift",
+  personalised: "personalized gift",
+  home_decor: "home decor",
+  occasion_gift: "birthday anniversary wedding gift",
+  other: "personalized gift",
+};
+
+async function handleWhatsAppFlowSubmission(
+  env: Bindings,
+  phone: string,
+  messageId: string,
+  language: Language,
+  submission: WhatsAppFlowSubmission,
+): Promise<void> {
+  await saveWhatsAppFlowSubmission(env, phone, messageId, submission);
+  if (submission.customerName) {
+    await upsertContact(env, phone, submission.customerName);
+  }
+
+  if (submission.requestType === "track") {
+    const orderNumber = extractOrderNumber(submission.orderNumber);
+    await handleTrackingFlow(
+      env,
+      phone,
+      language,
+      orderNumber ? `Order #${orderNumber}` : "track order",
+      orderNumber ? `order ${orderNumber}` : "track order",
+    );
+    return;
+  }
+
+  if (submission.requestType === "payment") {
+    await createHumanHandoff(env, phone, "whatsapp_flow_payment_help");
+    await replyAndLog(
+      env,
+      phone,
+      submission.orderNumber
+        ? `Payment help request mil gayi hai ✅\nOrder: ${submission.orderNumber}\nIG Store team checkout/payment verify karke yahin reply karegi. OTP, UPI PIN ya CVV share na karein.`
+        : "Payment/checkout help request mil gayi hai ✅\nIG Store team yahin reply karegi. OTP, UPI PIN ya CVV share na karein.",
+    );
+    return;
+  }
+
+  if (submission.requestType === "support") {
+    await createHumanHandoff(env, phone, "whatsapp_flow_customer_support");
+    await replyAndLog(
+      env,
+      phone,
+      submission.orderNumber
+        ? `Support request mil gayi hai ✅\nOrder: ${submission.orderNumber}\nIG Store team details check karke yahin reply karegi.`
+        : "Support request mil gayi hai ✅\nIG Store team details check karke yahin reply karegi.",
+    );
+    return;
+  }
+
+  if (submission.requestType === "feedback") {
+    await replyAndLog(
+      env,
+      phone,
+      `Thank you${submission.customerName ? `, ${submission.customerName}` : ""} 💚\nAapka feedback IG Store team ke paas save ho gaya hai.`,
+    );
+    return;
+  }
+
+  const categoryQuery = FLOW_PRODUCT_QUERIES[submission.productCategory] ?? "personalized gift";
+  const query = [categoryQuery, submission.details].filter(Boolean).join(" ").trim();
+  const products = await searchProducts(env, query);
+  const selected = rankAndFilterProducts(products, query, extractBudget(submission.details)).slice(0, 3);
+
+  if (selected.length === 0) {
+    await createHumanHandoff(
+      env,
+      phone,
+      submission.requestType === "custom"
+        ? "whatsapp_flow_custom_product"
+        : "whatsapp_flow_product_not_found",
+    );
+    await replyAndLog(
+      env,
+      phone,
+      "Aapki requirement mil gayi hai ✅\nExact verified product abhi nahi mila, isliye IG Store team suitable option confirm karke yahin reply karegi.",
+    );
+    return;
+  }
+
+  await replyAndLog(
+    env,
+    phone,
+    submission.requestType === "custom"
+      ? "Aapki personalised gift requirement ke matching verified options ye rahe:"
+      : "Aapki requirement ke matching IG Store products ye rahe:",
+  );
+  await sendProductCards(env, phone, language, selected);
+  await replyAndLog(
+    env,
+    phone,
+    "Order shuru karne ke liye *Order option 1*, *Order option 2* ya *Order option 3* likhein.",
+  );
+}
+
+async function saveWhatsAppFlowSubmission(
+  env: Bindings,
+  phone: string,
+  messageId: string,
+  submission: WhatsAppFlowSubmission,
+): Promise<void> {
+  const mobile = parseIndianMobile(submission.mobileNumber) ?? submission.mobileNumber.replace(/\D/g, "");
+  await env.DB.prepare(`
+    INSERT OR IGNORE INTO whatsapp_flow_submissions (
+      source_message_id, flow_id, phone, request_type, product_category,
+      customer_name, mobile_number, order_number, details, flow_token
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).bind(
+    messageId,
+    IG_STORE_FLOW_ID,
+    phone,
+    submission.requestType,
+    submission.productCategory,
+    submission.customerName,
+    mobile,
+    submission.orderNumber,
+    submission.details,
+    submission.flowToken,
+  ).run();
 }
 
 export function containsSensitivePaymentData(value: string): boolean {
@@ -2923,6 +3162,60 @@ export function extractWhatsAppMessageId(responseBody: string): string | null {
   }
 }
 
+export function buildWhatsAppFlowPayload(
+  to: string,
+  flowToken: string,
+): Record<string, unknown> {
+  return {
+    messaging_product: "whatsapp",
+    recipient_type: "individual",
+    to,
+    type: "interactive",
+    interactive: {
+      type: "flow",
+      header: { type: "text", text: "IG Store" },
+      body: {
+        text: "Shop gifts, personalise an item, track your order or get support—inside WhatsApp.",
+      },
+      footer: { text: "Secure help from IG Store" },
+      action: {
+        name: "flow",
+        parameters: {
+          flow_message_version: "3",
+          flow_token: flowToken,
+          flow_id: IG_STORE_FLOW_ID,
+          flow_cta: "Open IG Store",
+          flow_action: "navigate",
+          flow_action_payload: { screen: IG_STORE_FLOW_SCREEN },
+        },
+      },
+    },
+  };
+}
+
+async function sendWhatsAppFlowLauncher(
+  env: Bindings,
+  to: string,
+): Promise<string | null> {
+  const graphVersion = env.META_GRAPH_VERSION?.trim() || "v25.0";
+  const endpoint = `https://graph.facebook.com/${graphVersion}/${env.WHATSAPP_PHONE_NUMBER_ID}/messages`;
+  const flowToken = `igstore_${crypto.randomUUID()}`;
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${env.WHATSAPP_ACCESS_TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(buildWhatsAppFlowPayload(to, flowToken)),
+  });
+  const responseBody = await response.text();
+  console.log(`WhatsApp Flow launcher status: ${response.status}`, responseBody);
+  if (!response.ok) {
+    throw new Error(`WhatsApp Flow launcher failed with status ${response.status}`);
+  }
+  return extractWhatsAppMessageId(responseBody);
+}
+
 async function sendText(env: Bindings, to: string, body: string): Promise<string | null> {
   const graphVersion = env.META_GRAPH_VERSION?.trim() || "v25.0";
   const endpoint = `https://graph.facebook.com/${graphVersion}/${env.WHATSAPP_PHONE_NUMBER_ID}/messages`;
@@ -2993,6 +3286,16 @@ async function sendImage(
 async function replyAndLog(env: Bindings, phone: string, body: string): Promise<void> {
   const messageId = await sendText(env, phone, body);
   await saveConversation(env, phone, "out", body, messageId);
+}
+
+async function sendFlowLauncherAndLog(env: Bindings, phone: string): Promise<void> {
+  try {
+    const body = "IG Store Shopping & Support Flow\nButton: Open IG Store";
+    const messageId = await sendWhatsAppFlowLauncher(env, phone);
+    await saveConversation(env, phone, "out", body, messageId);
+  } catch (error) {
+    console.error("WhatsApp Flow launcher failed; text menu remains available", error);
+  }
 }
 
 async function initializeDatabase(env: Bindings): Promise<void> {
@@ -3221,6 +3524,25 @@ async function initializeDatabase(env: Bindings): Promise<void> {
         phone TEXT PRIMARY KEY,
         opted_out_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
       )
+    `),
+    env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS whatsapp_flow_submissions (
+        source_message_id TEXT PRIMARY KEY,
+        flow_id TEXT NOT NULL,
+        phone TEXT NOT NULL,
+        request_type TEXT NOT NULL,
+        product_category TEXT NOT NULL DEFAULT '',
+        customer_name TEXT NOT NULL DEFAULT '',
+        mobile_number TEXT NOT NULL DEFAULT '',
+        order_number TEXT NOT NULL DEFAULT '',
+        details TEXT NOT NULL DEFAULT '',
+        flow_token TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )
+    `),
+    env.DB.prepare(`
+      CREATE INDEX IF NOT EXISTS idx_whatsapp_flow_submissions_phone
+      ON whatsapp_flow_submissions(phone, created_at)
     `),
     env.DB.prepare(`
       CREATE TABLE IF NOT EXISTS notification_sends (
