@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   ABANDONED_NEW_ONLY_SINCE,
+  abandonedDestinationUrl,
   abandonedRecoveryButtonSuffix,
   allOrderVariants,
   buildAbandonedTemplatePayload,
@@ -11,6 +12,7 @@ import {
   extractMessageStatuses,
   extractWhatsAppFlowSubmission,
   extractWhatsAppMessageId,
+  hasWhatsAppMarketingConsent,
   IG_STORE_FLOW_ID,
   IG_STORE_FLOW_RESULT_SCREENS,
   extractOrderNumber,
@@ -19,6 +21,7 @@ import {
   parseIndianMobile,
   requiresHumanSupport,
   supportOwnerAlertParameters,
+  SHOPIFY_AUTOMATION_WEBHOOK_TOPICS,
   welcomeMessage,
 } from "../../src/index";
 import { repairMojibake } from "../../src/entry";
@@ -229,9 +232,81 @@ describe("priority WhatsApp flows", () => {
       status: "read",
       recipientId: "919876543210",
       timestamp: 1786500000,
+      errorCode: "",
+      errorMessage: "",
     }]);
     expect(deliveryStatusRank("read")).toBeGreaterThan(deliveryStatusRank("delivered"));
     expect(deliveryStatusRank("delivered")).toBeGreaterThan(deliveryStatusRank("sent"));
+  });
+
+  it("records Meta failure details for delivery troubleshooting", () => {
+    const [status] = extractMessageStatuses({
+      entry: [{ changes: [{ value: { statuses: [{
+        id: "wamid.failed-1",
+        status: "failed",
+        recipient_id: "919876543210",
+        errors: [{ code: 131049, error_data: { details: "Message not delivered" } }],
+      }] } }] }],
+    });
+    expect(status).toMatchObject({
+      status: "failed",
+      errorCode: "131049",
+      errorMessage: "Message not delivered",
+    });
+  });
+
+  it("uses Shopify WhatsApp consent, never SMS consent, for marketing reminders", () => {
+    expect(hasWhatsAppMarketingConsent({
+      whatsapp_marketing_consent_state: "SUBSCRIBED",
+    })).toBe(true);
+    expect(hasWhatsAppMarketingConsent({ buyer_accepts_sms_marketing: true })).toBe(false);
+    expect(hasWhatsAppMarketingConsent({
+      note_attributes: [{ name: "WhatsApp opt in", value: "yes" }],
+    })).toBe(true);
+  });
+
+  it("subscribes to cart, checkout, purchase and fulfillment lifecycle webhooks", () => {
+    expect(SHOPIFY_AUTOMATION_WEBHOOK_TOPICS).toEqual(expect.arrayContaining([
+      "CARTS_CREATE",
+      "CARTS_UPDATE",
+      "CHECKOUTS_CREATE",
+      "CHECKOUTS_UPDATE",
+      "ORDERS_CREATE",
+      "ORDERS_PAID",
+      "ORDERS_UPDATED",
+    ]));
+  });
+
+  it("builds the exact recovery destination and accepts a click-tracking token", () => {
+    expect(abandonedDestinationUrl(
+      "https://igstore.in/checkouts/recover/cart-token?key=secret",
+      "CART5",
+    )).toContain("https://igstore.in/discount/CART5?redirect=");
+    const payload = buildAbandonedTemplatePayload(
+      {
+        checkout_token: "checkout-track",
+        phone: "919876543210",
+        customer_name: "Asha",
+        product_title: "Name Plate",
+        product_image: null,
+        total_price: 499,
+        currency: "INR",
+        recovery_url: "https://igstore.in/checkouts/recover/cart-token",
+        consent: 1,
+        status: "pending",
+        due_at: Date.now(),
+        attempts: 0,
+        created_at: Date.now(),
+      },
+      {
+        templateName: "ig_abandoned_checkout_tracked_r1",
+        language: "en",
+        fallbackImage: "https://cdn.example.com/fallback.jpg",
+        buttonSuffix: "0123456789abcdef0123456789abcdef",
+      },
+    ) as any;
+    expect(payload.template.components[2].parameters[0].text)
+      .toBe("0123456789abcdef0123456789abcdef");
   });
 
   it("stores the outgoing Meta message id used by blue ticks", () => {
@@ -369,5 +444,6 @@ describe("priority WhatsApp flows", () => {
     expect(welcome).not.toContain("1. Personalized Gifts");
   });
 });
+
 
 
