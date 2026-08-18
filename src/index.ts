@@ -2458,7 +2458,7 @@ async function upsertAbandonedCheckout(env: Bindings, payload: any): Promise<voi
   } else if (!phone) {
     status = "skipped";
     skipReason = "phone_missing";
-  } else if (await hasCompletedOrderForPhone(env, phone)) {
+  } else if (await hasCompletedOrderForPhone(env, phone, activityAt)) {
     status = "recovered";
     skipReason = "customer_already_purchased";
   } else if (!consent) {
@@ -2718,15 +2718,20 @@ async function hasStoredWhatsAppMarketingConsent(
   return Boolean(optedIn);
 }
 
-async function hasCompletedOrderForPhone(env: Bindings, phone: string): Promise<boolean> {
+async function hasCompletedOrderForPhone(
+  env: Bindings,
+  phone: string,
+  checkoutActivityAt = 0,
+): Promise<boolean> {
   const order = await env.DB.prepare(`
     SELECT order_id
     FROM shopify_orders
     WHERE substr(phone, -10) = substr(?, -10)
       AND cancelled_at = ''
       AND lower(replace(financial_status, ' ', '_')) IN ('paid', 'authorized', 'partially_paid')
+      AND (CAST(strftime('%s', created_at) AS INTEGER) * 1000) >= ?
     LIMIT 1
-  `).bind(phone).first();
+  `).bind(phone, checkoutActivityAt).first();
   return Boolean(order);
 }
 
@@ -2864,7 +2869,7 @@ async function processDueAbandonedCheckouts(env: Bindings): Promise<void> {
     if (Number(claimed.meta?.changes ?? 0) === 0) continue;
 
     try {
-      if (await hasCompletedOrderForPhone(env, checkout.phone)) {
+      if (await hasCompletedOrderForPhone(env, checkout.phone, checkout.created_at)) {
         const recoveredAt = Date.now();
         await env.DB.prepare(`
           UPDATE abandoned_checkouts
