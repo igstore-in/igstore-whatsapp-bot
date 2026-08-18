@@ -12,7 +12,8 @@
   "vars": {
     "SHOPIFY_ADMIN_DOMAIN": "nnruh1-fa.myshopify.com",
     "SHOPIFY_CLIENT_ID": "2b873ac6c1738dc7b8b99b236ab65569",
-    "SUPPORT_ALERT_PHONE": "919587666693"
+    "SUPPORT_ALERT_PHONE": "919587666693",
+    "SUPPORT_ALERT_TEMPLATE_NAME": "ig_support_owner_alert"
   },
   "d1_databases": [
     {
