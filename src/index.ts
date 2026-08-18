@@ -20,6 +20,10 @@ type Bindings = {
   ABANDONED_TEMPLATE_THIRD?: string;
   ABANDONED_TEMPLATE_LANGUAGE?: string;
   ABANDONED_FALLBACK_IMAGE_URL?: string;
+  ABANDONED_TRACKING_ORIGIN?: string;
+  ABANDONED_TRACKED_TEMPLATE_FIRST?: string;
+  ABANDONED_TRACKED_TEMPLATE_SECOND?: string;
+  ABANDONED_TRACKED_TEMPLATE_THIRD?: string;
   ORDER_CONFIRMATION_TEMPLATE_NAME?: string;
   FULFILLMENT_TEMPLATE_NAME?: string;
   DELIVERY_FEEDBACK_TEMPLATE_NAME?: string;
@@ -137,6 +141,13 @@ type AbandonedCheckoutRow = {
   created_at: number;
 };
 
+type AbandonedTemplateSend = {
+  messageId: string | null;
+  templateName: string;
+  trackingToken: string | null;
+  destinationUrl: string;
+};
+
 export type WhatsAppFlowSubmission = {
   requestType: "shop" | "custom" | "track" | "payment" | "support" | "feedback";
   productCategory: string;
@@ -188,6 +199,17 @@ const DEFAULT_ABANDONED_TEMPLATE = "ig_abandoned_checkout_r1_image";
 const DEFAULT_ABANDONED_SECOND_TEMPLATE = "ig_abandoned_checkout_r2_5off";
 const DEFAULT_ABANDONED_THIRD_TEMPLATE = "ig_abandoned_checkout_final_10off";
 const DEFAULT_ABANDONED_TEMPLATE_LANGUAGE = "en";
+export const SHOPIFY_AUTOMATION_WEBHOOK_TOPICS = [
+  "CARTS_CREATE",
+  "CARTS_UPDATE",
+  "CHECKOUTS_CREATE",
+  "CHECKOUTS_UPDATE",
+  "ORDERS_CREATE",
+  "ORDERS_PAID",
+  "ORDERS_UPDATED",
+  "FULFILLMENTS_CREATE",
+  "FULFILLMENTS_UPDATE",
+] as const;
 const DEFAULT_REENGAGEMENT_TEMPLATE = "customer_reengagement_30d";
 const DEFAULT_FEEDBACK_TEMPLATE = "delivery_feedback";
 const DEFAULT_ORDER_CONFIRMATION_TEMPLATE = "order_confirmation";
@@ -373,6 +395,31 @@ app.post("/shopify/webhook", async (c) => {
   return c.text("OK", 200);
 });
 
+app.get("/r/:token", async (c) => {
+  await initializeDatabase(c.env);
+  const token = String(c.req.param("token") ?? "").trim();
+  if (!/^[a-f0-9]{32}$/i.test(token)) return c.text("Link not found", 404);
+
+  const event = await c.env.DB.prepare(`
+    SELECT destination_url
+    FROM abandoned_message_events
+    WHERE tracking_token = ?
+    LIMIT 1
+  `).bind(token).first<{ destination_url: string }>();
+  if (!event?.destination_url || !/^https:\/\//i.test(event.destination_url)) {
+    return c.text("Link not found", 404);
+  }
+
+  const now = Date.now();
+  await c.env.DB.prepare(`
+    UPDATE abandoned_message_events
+    SET clicked_at = COALESCE(clicked_at, ?), updated_at = ?
+    WHERE tracking_token = ?
+  `).bind(now, now, token).run();
+  c.header("Cache-Control", "no-store");
+  return c.redirect(event.destination_url, 302);
+});
+
 app.get("/shopify/health", async (c) => {
   await initializeDatabase(c.env);
   const counts = await c.env.DB.prepare(`
@@ -385,6 +432,13 @@ app.get("/shopify/health", async (c) => {
       COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) AS failed,
       COALESCE(SUM(attempts), 0) AS remindersAccepted
     FROM abandoned_checkouts
+  `).first();
+  const tracking = await abandonedMessageTrackingCounts(c.env);
+  const carts = await c.env.DB.prepare(`
+    SELECT COUNT(*) AS total,
+      COALESCE(SUM(CASE WHEN status = 'checkout_started' THEN 1 ELSE 0 END), 0) AS checkoutStarted,
+      COALESCE(SUM(CASE WHEN status = 'purchased' THEN 1 ELSE 0 END), 0) AS purchased
+    FROM shopify_cart_events
   `).first();
 
   return c.json({
@@ -400,6 +454,8 @@ app.get("/shopify/health", async (c) => {
     stopKeywordEnabled: true,
     minimumAmount: ABANDONED_MINIMUM_AMOUNT,
     counts: counts ?? {},
+    messageTracking: tracking,
+    carts: carts ?? {},
   });
 });
 
@@ -532,11 +588,15 @@ app.get("/admin/api/messages", async (c) => {
   }
 
   const result = await c.env.DB.prepare(`
-    SELECT id, phone, direction, body, whatsapp_message_id,
-           delivery_status, status_updated_at, created_at
-    FROM conversations
-    WHERE phone = ?
-    ORDER BY id ASC
+    SELECT c.id, c.phone, c.direction, c.body, c.whatsapp_message_id,
+           c.delivery_status, c.status_updated_at, c.created_at,
+           e.stage AS abandoned_stage, e.template_name, e.destination_url,
+           e.clicked_at, e.purchased_at, e.error_code, e.error_message
+    FROM conversations c
+    LEFT JOIN abandoned_message_events e
+      ON e.message_id = c.whatsapp_message_id
+    WHERE c.phone = ?
+    ORDER BY c.id ASC
     LIMIT 500
   `)
     .bind(phone)
@@ -660,6 +720,24 @@ app.post("/admin/api/send-offer", async (c) => {
     started: true,
     recipientCount: recipients.length,
     templateName,
+  });
+});
+
+app.get("/admin/api/abandoned-stats", async (c) => {
+  await initializeDatabase(c.env);
+  const checkouts = await abandonedCheckoutCounts(c.env);
+  const messageTracking = await abandonedMessageTrackingCounts(c.env);
+  const skipReasons = await c.env.DB.prepare(`
+    SELECT COALESCE(skip_reason, 'none') AS reason, COUNT(*) AS total
+    FROM abandoned_checkouts
+    GROUP BY COALESCE(skip_reason, 'none')
+    ORDER BY total DESC
+  `).all();
+  return c.json({
+    ok: true,
+    checkouts,
+    messageTracking,
+    skipReasons: skipReasons.results ?? [],
   });
 });
 
@@ -941,6 +1019,8 @@ export type WhatsAppMessageStatus = {
   status: "sent" | "delivered" | "read" | "failed";
   recipientId: string;
   timestamp: number | null;
+  errorCode: string;
+  errorMessage: string;
 };
 
 export function extractMessageStatuses(payload: any): WhatsAppMessageStatus[] {
@@ -957,6 +1037,13 @@ export function extractMessageStatuses(payload: any): WhatsAppMessageStatus[] {
           status: status as WhatsAppMessageStatus["status"],
           recipientId: String(item?.recipient_id ?? ""),
           timestamp: Number.isFinite(timestamp) ? timestamp : null,
+          errorCode: String(item?.errors?.[0]?.code ?? ""),
+          errorMessage: String(
+            item?.errors?.[0]?.error_data?.details ??
+              item?.errors?.[0]?.message ??
+              item?.errors?.[0]?.title ??
+              "",
+          ).slice(0, 1000),
         });
       }
     }
@@ -979,20 +1066,51 @@ async function updateOutboundMessageStatus(
 
   await env.DB.prepare(`
     INSERT INTO whatsapp_message_statuses (
-      message_id, phone, status, status_timestamp, updated_at
-    ) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+      message_id, phone, status, status_timestamp, error_code, error_message, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
     ON CONFLICT(message_id) DO UPDATE SET
       phone = CASE WHEN excluded.phone != '' THEN excluded.phone ELSE whatsapp_message_statuses.phone END,
       status = excluded.status,
       status_timestamp = excluded.status_timestamp,
+      error_code = excluded.error_code,
+      error_message = excluded.error_message,
       updated_at = CURRENT_TIMESTAMP
-  `).bind(update.id, update.recipientId, update.status, update.timestamp).run();
+  `).bind(
+    update.id,
+    update.recipientId,
+    update.status,
+    update.timestamp,
+    update.errorCode,
+    update.errorMessage,
+  ).run();
 
   await env.DB.prepare(`
     UPDATE conversations
     SET delivery_status = ?, status_updated_at = CURRENT_TIMESTAMP
     WHERE whatsapp_message_id = ? AND direction = 'out'
   `).bind(update.status, update.id).run();
+
+  const statusAt = update.timestamp ? update.timestamp * 1000 : Date.now();
+  await env.DB.prepare(`
+    UPDATE abandoned_message_events
+    SET status = ?,
+        error_code = ?,
+        error_message = ?,
+        delivered_at = CASE WHEN ? IN ('delivered', 'read') THEN COALESCE(delivered_at, ?) ELSE delivered_at END,
+        read_at = CASE WHEN ? = 'read' THEN COALESCE(read_at, ?) ELSE read_at END,
+        updated_at = ?
+    WHERE message_id = ?
+  `).bind(
+    update.status,
+    update.errorCode,
+    update.errorMessage,
+    update.status,
+    statusAt,
+    update.status,
+    statusAt,
+    Date.now(),
+    update.id,
+  ).run();
 }
 
 function getIncomingContent(message: any):
@@ -1408,7 +1526,9 @@ export function buildSupportOwnerAlert(
   const requestLabel = supportOwnerRequestLabel(reason, context.requestType);
 
   return [
-    "🔔 IG Store customer needs support",
+    reason === "abandoned_checkout_purchase"
+      ? "✅ IG Store abandoned checkout converted"
+      : "🔔 IG Store customer needs support",
     context.customerName ? `Name: ${context.customerName}` : "",
     customerWhatsApp ? `Customer WhatsApp: +${customerWhatsApp}` : "",
     submittedMobile && submittedMobile !== customerWhatsApp
@@ -1417,7 +1537,9 @@ export function buildSupportOwnerAlert(
     `Request: ${requestLabel}`,
     context.orderNumber ? `Order: ${context.orderNumber}` : "",
     context.details ? `Details: ${context.details.slice(0, 700)}` : "",
-    "Please reply to the customer from the IG Store inbox.",
+    reason === "abandoned_checkout_purchase"
+      ? "The reminder sequence has been stopped for this customer."
+      : "Please reply to the customer from the IG Store inbox.",
   ].filter(Boolean).join("\n");
 }
 
@@ -1431,6 +1553,9 @@ function supportOwnerRequestLabel(
     custom: "Custom product help",
     shop: "Product help",
   };
+  if (reason === "abandoned_checkout_purchase") {
+    return "Abandoned checkout purchase";
+  }
   return requestType
     ? typeLabels[requestType] ?? requestType
     : reason.replace(/_/g, " ");
@@ -2216,7 +2341,13 @@ async function processShopifyWebhook(
       return;
     }
 
+    if (topic === "carts/create" || topic === "carts/update") {
+      await upsertShopifyCartEvent(env, payload);
+      return;
+    }
+
     if (topic === "checkouts/create" || topic === "checkouts/update") {
+      await markShopifyCartCheckoutStarted(env, String(payload?.cart_token ?? ""));
       await upsertAbandonedCheckout(env, payload);
       return;
     }
@@ -2227,8 +2358,10 @@ async function processShopifyWebhook(
       topic === "orders/updated"
     ) {
       await upsertShopifyOrder(env, payload);
+      await attributeAbandonedCheckoutPurchase(env, topic, payload);
       await markCheckoutRecovered(env, String(payload?.checkout_token ?? ""));
       await markCheckoutsRecoveredByPhone(env, orderPhone(payload));
+      await markShopifyCartPurchased(env, String(payload?.cart_token ?? ""));
       await notifyOrderConfirmation(env, topic, payload);
       return;
     }
@@ -2294,7 +2427,7 @@ async function upsertAbandonedCheckout(env: Bindings, payload: any): Promise<voi
     ));
   const now = Date.now();
   const checkoutActivityAt = Date.parse(
-    String(payload?.created_at ?? payload?.updated_at ?? ""),
+    String(payload?.updated_at ?? payload?.created_at ?? ""),
   );
   const activityAt = Number.isFinite(checkoutActivityAt) ? checkoutActivityAt : now;
   const dueAt = activityAt + ABANDONED_FIRST_DELAY_MINUTES * 60_000;
@@ -2370,7 +2503,7 @@ async function upsertAbandonedCheckout(env: Bindings, payload: any): Promise<voi
       END,
       due_at = CASE
         WHEN abandoned_checkouts.attempts > 0 THEN abandoned_checkouts.due_at
-        ELSE MIN(abandoned_checkouts.due_at, excluded.due_at)
+        ELSE excluded.due_at
       END,
       updated_at = excluded.updated_at
   `)
@@ -2391,6 +2524,16 @@ async function upsertAbandonedCheckout(env: Bindings, payload: any): Promise<voi
       now,
     )
     .run();
+
+  if (phone && consent) {
+    await env.DB.prepare(`
+      INSERT INTO whatsapp_marketing_opt_ins (phone, source, consented_at)
+      VALUES (?, 'shopify_whatsapp_consent', CURRENT_TIMESTAMP)
+      ON CONFLICT(phone) DO UPDATE SET
+        source = excluded.source,
+        consented_at = excluded.consented_at
+    `).bind(phone).run();
+  }
 
   console.log("Checkout stored:", checkoutToken, status, skipReason ?? "");
 }
@@ -2426,8 +2569,14 @@ function normalizeWhatsAppPhone(value: string): string | null {
   return digits;
 }
 
-function hasWhatsAppMarketingConsent(payload: any): boolean {
-  if (payload?.buyer_accepts_sms_marketing === true) return true;
+export function hasWhatsAppMarketingConsent(payload: any): boolean {
+  const state = String(
+    payload?.whatsapp_marketing_consent_state ??
+      payload?.whatsapp_marketing_consent?.state ??
+      payload?.customer?.default_phone_number?.whats_app_marketing_consent?.state ??
+      "",
+  ).toUpperCase();
+  if (state === "SUBSCRIBED") return true;
 
   const attributes = Array.isArray(payload?.note_attributes)
     ? payload.note_attributes
@@ -2500,12 +2649,58 @@ async function markCheckoutRecovered(
   await env.DB.prepare(`
     UPDATE abandoned_checkouts
     SET status = 'recovered', recovered_at = ?, updated_at = ?
-    WHERE checkout_token = ? AND status != 'sent'
+    WHERE checkout_token = ? AND status != 'recovered'
   `)
     .bind(now, now, checkoutToken)
     .run();
 
   console.log("Checkout marked recovered:", checkoutToken);
+}
+
+async function upsertShopifyCartEvent(env: Bindings, payload: any): Promise<void> {
+  const cartToken = String(payload?.token ?? payload?.id ?? "").trim();
+  if (!cartToken) return;
+  const items = Array.isArray(payload?.line_items) ? payload.line_items : [];
+  const total = Number(
+    payload?.total_price ??
+      items.reduce((sum: number, item: any) =>
+        sum + Number(item?.price ?? 0) * Number(item?.quantity ?? 1), 0),
+  );
+  await env.DB.prepare(`
+    INSERT INTO shopify_cart_events (
+      cart_token, status, item_count, total_price, currency, created_at, updated_at
+    ) VALUES (?, 'active', ?, ?, ?, ?, ?)
+    ON CONFLICT(cart_token) DO UPDATE SET
+      item_count = excluded.item_count,
+      total_price = excluded.total_price,
+      currency = excluded.currency,
+      updated_at = excluded.updated_at
+  `).bind(
+    cartToken,
+    items.reduce((sum: number, item: any) => sum + Number(item?.quantity ?? 1), 0),
+    Number.isFinite(total) ? total : 0,
+    String(payload?.currency ?? "INR"),
+    Date.parse(String(payload?.created_at ?? "")) || Date.now(),
+    Date.parse(String(payload?.updated_at ?? "")) || Date.now(),
+  ).run();
+}
+
+async function markShopifyCartCheckoutStarted(env: Bindings, cartToken: string): Promise<void> {
+  if (!cartToken) return;
+  await env.DB.prepare(`
+    UPDATE shopify_cart_events
+    SET status = 'checkout_started', checkout_started_at = COALESCE(checkout_started_at, ?), updated_at = ?
+    WHERE cart_token = ? AND status != 'purchased'
+  `).bind(Date.now(), Date.now(), cartToken).run();
+}
+
+async function markShopifyCartPurchased(env: Bindings, cartToken: string): Promise<void> {
+  if (!cartToken) return;
+  await env.DB.prepare(`
+    UPDATE shopify_cart_events
+    SET status = 'purchased', purchased_at = COALESCE(purchased_at, ?), updated_at = ?
+    WHERE cart_token = ?
+  `).bind(Date.now(), Date.now(), cartToken).run();
 }
 
 async function hasStoredWhatsAppMarketingConsent(
@@ -2545,8 +2740,65 @@ async function markCheckoutsRecoveredByPhone(
     UPDATE abandoned_checkouts
     SET status = 'recovered', recovered_at = ?, updated_at = ?
     WHERE substr(phone, -10) = substr(?, -10)
-      AND status IN ('pending', 'processing')
+      AND status IN ('pending', 'processing', 'sent')
   `).bind(now, now, phone).run();
+}
+
+async function attributeAbandonedCheckoutPurchase(
+  env: Bindings,
+  topic: string,
+  payload: any,
+): Promise<void> {
+  const checkoutToken = String(payload?.checkout_token ?? "").trim();
+  const phone = orderPhone(payload);
+  const row = checkoutToken
+    ? await env.DB.prepare(`
+        SELECT checkout_token, phone, customer_name, product_title, total_price, currency, attempts
+        FROM abandoned_checkouts
+        WHERE checkout_token = ? AND attempts > 0
+        LIMIT 1
+      `).bind(checkoutToken).first<any>()
+    : null;
+  const attributed = row ?? (phone
+    ? await env.DB.prepare(`
+        SELECT checkout_token, phone, customer_name, product_title, total_price, currency, attempts
+        FROM abandoned_checkouts
+        WHERE substr(phone, -10) = substr(?, -10) AND attempts > 0
+        ORDER BY updated_at DESC
+        LIMIT 1
+      `).bind(phone).first<any>()
+    : null);
+  if (!attributed) return;
+
+  const financialStatus = normalize(String(payload?.financial_status ?? ""));
+  const paid = topic === "orders/paid" ||
+    ["paid", "authorized", "partially paid", "partially_paid"].includes(financialStatus);
+  if (!paid) return;
+
+  const now = Date.now();
+  await env.DB.prepare(`
+    UPDATE abandoned_message_events
+    SET purchased_at = COALESCE(purchased_at, ?), updated_at = ?
+    WHERE checkout_token = ?
+  `).bind(now, now, attributed.checkout_token).run();
+
+  const orderId = String(
+    payload?.id ?? payload?.admin_graphql_api_id ?? payload?.order_number ?? "",
+  );
+  const orderName = String(payload?.name ?? `#${payload?.order_number ?? ""}`);
+  try {
+    await notifySupportOwner(env, attributed.phone || phone || "", "abandoned_checkout_purchase", {
+      eventKey: `abandoned-conversion:${orderId}`,
+      customerName: attributed.customer_name,
+      orderNumber: orderName,
+      details: `${attributed.product_title} · ${formatCheckoutAmount(
+        Number(payload?.current_total_price ?? payload?.total_price ?? attributed.total_price ?? 0),
+        String(payload?.currency ?? attributed.currency ?? "INR"),
+      )} · Converted after ${attributed.attempts} reminder(s)`,
+    });
+  } catch (error) {
+    console.error("Abandoned checkout owner alert failed:", error);
+  }
 }
 
 async function processDueAbandonedCheckouts(env: Bindings): Promise<void> {
@@ -2633,7 +2885,7 @@ async function processDueAbandonedCheckouts(env: Bindings): Promise<void> {
       }
 
       const stage = Math.min(3, Number(checkout.attempts ?? 0) + 1);
-      const messageId = await sendAbandonedCheckoutTemplate(env, checkout, stage);
+      const sent = await sendAbandonedCheckoutTemplate(env, checkout, stage);
       const nextDueAt = nextAbandonedReminderAt(stage, Date.now());
       const nextStatus = stage >= 3 ? "sent" : "pending";
       await env.DB.prepare(`
@@ -2661,7 +2913,7 @@ async function processDueAbandonedCheckouts(env: Bindings): Promise<void> {
           : stage === 2
             ? `🛍️ You left something special behind!\n\nProduct: ${checkout.product_title}\nCart Value: ${formatCheckoutAmount(checkout.total_price, checkout.currency)}\n\n🎁 Special Offer: Get 5% OFF your order!\n\nYour checkout is still incomplete. Complete your order now and enjoy your special discount.\n\n📦 Pan India Delivery\n🔒 Secure Online Payment\n✨ Quality Products by IG Store\n\nNeed help? Just reply to this message.\n\n— Team IG Store`
             : `⏳ Last chance to complete your order!\n\nProduct: ${checkout.product_title}\nCart Value: ${formatCheckoutAmount(checkout.total_price, checkout.currency)}\n\n🎉 Final Offer: Get 10% OFF your order!\n\nThis is your final reminder. Complete your purchase now and save 10% on your order.\n\nDon’t miss your special offer! 🎁\n\n📦 Pan India Delivery\n🔒 Secure Online Payment\n✨ Thank you for choosing IG Store\n\nNeed help? Just reply to this message.\n\n— Team IG Store`}\n\n[Button: Complete Your Order]`,
-        messageId,
+        sent.messageId,
       );
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -2710,6 +2962,20 @@ async function abandonedCheckoutCounts(env: Bindings): Promise<Record<string, nu
   return row ?? {};
 }
 
+async function abandonedMessageTrackingCounts(env: Bindings): Promise<Record<string, number>> {
+  const row = await env.DB.prepare(`
+    SELECT
+      COUNT(*) AS sent,
+      COALESCE(SUM(CASE WHEN delivered_at IS NOT NULL THEN 1 ELSE 0 END), 0) AS delivered,
+      COALESCE(SUM(CASE WHEN read_at IS NOT NULL THEN 1 ELSE 0 END), 0) AS read,
+      COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) AS failed,
+      COALESCE(SUM(CASE WHEN clicked_at IS NOT NULL THEN 1 ELSE 0 END), 0) AS clicked,
+      COALESCE(SUM(CASE WHEN purchased_at IS NOT NULL THEN 1 ELSE 0 END), 0) AS purchased
+    FROM abandoned_message_events
+  `).first<Record<string, number>>();
+  return row ?? {};
+}
+
 async function ensureShopifyWebhookSubscriptions(
   env: Bindings,
   force = false,
@@ -2722,12 +2988,7 @@ async function ensureShopifyWebhookSubscriptions(
   if (!domain || !token) return;
 
   const endpoint = "https://igstore-whatsapp-bot.igstore-jpr.workers.dev/shopify/webhook";
-  const desiredTopics = [
-    "ORDERS_CREATE",
-    "ORDERS_PAID",
-    "FULFILLMENTS_CREATE",
-    "FULFILLMENTS_UPDATE",
-  ];
+  const desiredTopics = SHOPIFY_AUTOMATION_WEBHOOK_TOPICS;
   const listQuery = `
     query IgStoreWebhookSubscriptions {
       webhookSubscriptions(first: 100) {
@@ -2847,7 +3108,7 @@ async function syncAbandonedCheckoutsFromShopify(env: Bindings): Promise<void> {
             firstName
             defaultPhoneNumber {
               phoneNumber
-              marketingState
+              whatsAppMarketingConsent { state updatedAt }
             }
           }
           shippingAddress { firstName phone }
@@ -2922,8 +3183,8 @@ async function syncAbandonedCheckoutsFromShopify(env: Bindings): Promise<void> {
           total_price: money?.amount,
           currency: money?.currencyCode,
           phone: phoneRecord?.phoneNumber ?? checkout?.shippingAddress?.phone,
-          buyer_accepts_sms_marketing:
-            String(phoneRecord?.marketingState ?? "").toUpperCase() === "SUBSCRIBED",
+          whatsapp_marketing_consent_state:
+            String(phoneRecord?.whatsAppMarketingConsent?.state ?? ""),
           customer: { first_name: checkout?.customer?.firstName },
           shipping_address: {
             first_name: checkout?.shippingAddress?.firstName,
@@ -2971,7 +3232,10 @@ async function syncMarketingCustomers(env: Bindings): Promise<void> {
           id
           displayName
           numberOfOrders
-          defaultPhoneNumber { phoneNumber marketingState }
+          defaultPhoneNumber {
+            phoneNumber
+            whatsAppMarketingConsent { state updatedAt }
+          }
         }
         pageInfo { hasNextPage endCursor }
       }
@@ -3017,7 +3281,7 @@ async function syncMarketingCustomers(env: Bindings): Promise<void> {
       );
       if (!phone) continue;
       const optedIn =
-        String(customer?.defaultPhoneNumber?.marketingState ?? "").toUpperCase() ===
+        String(customer?.defaultPhoneNumber?.whatsAppMarketingConsent?.state ?? "").toUpperCase() ===
           "SUBSCRIBED" &&
         !(await isWhatsAppMarketingOptedOut(env, phone));
       await env.DB.prepare(`
@@ -3086,14 +3350,14 @@ async function sendAbandonedCheckoutTemplate(
   env: Bindings,
   checkout: AbandonedCheckoutRow,
   stage: number,
-): Promise<string | null> {
+): Promise<AbandonedTemplateSend> {
   if (!checkout.phone || !checkout.recovery_url || checkout.consent !== 1) {
     throw new Error("Checkout is missing phone, recovery URL or consent");
   }
 
   const graphVersion = env.META_GRAPH_VERSION?.trim() || "v25.0";
   const endpoint = `https://graph.facebook.com/${graphVersion}/${env.WHATSAPP_PHONE_NUMBER_ID}/messages`;
-  const templateName =
+  const currentTemplateName =
     stage === 1
       ? env.ABANDONED_TEMPLATE_FIRST?.trim() ||
         env.ABANDONED_TEMPLATE_NAME?.trim() ||
@@ -3101,8 +3365,17 @@ async function sendAbandonedCheckoutTemplate(
       : stage === 2
         ? env.ABANDONED_TEMPLATE_SECOND?.trim() ||
           DEFAULT_ABANDONED_SECOND_TEMPLATE
-        : env.ABANDONED_TEMPLATE_THIRD?.trim() ||
-          DEFAULT_ABANDONED_THIRD_TEMPLATE;
+         : env.ABANDONED_TEMPLATE_THIRD?.trim() ||
+           DEFAULT_ABANDONED_THIRD_TEMPLATE;
+  const trackingOrigin = normalizedTrackingOrigin(env.ABANDONED_TRACKING_ORIGIN);
+  const trackedTemplateName = trackingOrigin
+    ? stage === 1
+      ? env.ABANDONED_TRACKED_TEMPLATE_FIRST?.trim()
+      : stage === 2
+        ? env.ABANDONED_TRACKED_TEMPLATE_SECOND?.trim()
+        : env.ABANDONED_TRACKED_TEMPLATE_THIRD?.trim()
+    : "";
+  const templateName = trackedTemplateName || currentTemplateName;
   const offer =
     stage === 1
       ? "No discount"
@@ -3115,6 +3388,10 @@ async function sendAbandonedCheckoutTemplate(
       : offer.includes(ABANDONED_OFFER_CODE)
         ? ABANDONED_OFFER_CODE
         : ABANDONED_FINAL_OFFER_CODE;
+  const destinationUrl = abandonedDestinationUrl(checkout.recovery_url, offerCode);
+  const trackingToken = trackingOrigin && trackedTemplateName
+    ? crypto.randomUUID().replace(/-/g, "")
+    : null;
   const payload = buildAbandonedTemplatePayload(checkout, {
     templateName,
     language:
@@ -3123,6 +3400,7 @@ async function sendAbandonedCheckoutTemplate(
     fallbackImage:
       env.ABANDONED_FALLBACK_IMAGE_URL?.trim() || DEFAULT_FALLBACK_IMAGE,
     offerCode,
+    buttonSuffix: trackingToken,
   });
 
   const response = await fetch(endpoint, {
@@ -3142,7 +3420,34 @@ async function sendAbandonedCheckoutTemplate(
       `WhatsApp template failed (${response.status}): ${responseBody.slice(0, 500)}`,
     );
   }
-  return extractWhatsAppMessageId(responseBody);
+  const messageId = extractWhatsAppMessageId(responseBody);
+  if (messageId || trackingToken) {
+    await env.DB.prepare(`
+      INSERT INTO abandoned_message_events (
+        message_id, checkout_token, phone, stage, template_name, tracking_token,
+        destination_url, status, sent_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'sent', ?, ?)
+      ON CONFLICT(message_id) DO UPDATE SET
+        checkout_token = excluded.checkout_token,
+        phone = excluded.phone,
+        stage = excluded.stage,
+        template_name = excluded.template_name,
+        tracking_token = excluded.tracking_token,
+        destination_url = excluded.destination_url,
+        updated_at = excluded.updated_at
+    `).bind(
+      messageId || `pending:${trackingToken}`,
+      checkout.checkout_token,
+      checkout.phone,
+      stage,
+      templateName,
+      trackingToken,
+      destinationUrl,
+      Date.now(),
+      Date.now(),
+    ).run();
+  }
+  return { messageId, templateName, trackingToken, destinationUrl };
 }
 
 export function buildAbandonedTemplatePayload(
@@ -3152,6 +3457,7 @@ export function buildAbandonedTemplatePayload(
     language: string;
     fallbackImage: string;
     offerCode?: string;
+    buttonSuffix?: string | null;
   },
 ): Record<string, unknown> {
   const imageUrl = checkout.product_image || options.fallbackImage;
@@ -3184,13 +3490,38 @@ export function buildAbandonedTemplatePayload(
           parameters: [
             {
               type: "text",
-              text: abandonedRecoveryButtonSuffix(checkout.recovery_url, options.offerCode),
+              text: options.buttonSuffix ||
+                abandonedRecoveryButtonSuffix(checkout.recovery_url, options.offerCode),
             },
           ],
         },
       ],
     },
   };
+}
+
+function normalizedTrackingOrigin(value?: string): string | null {
+  try {
+    const parsed = new URL(String(value ?? "").trim());
+    if (parsed.protocol !== "https:") return null;
+    return parsed.origin;
+  } catch {
+    return null;
+  }
+}
+
+export function abandonedDestinationUrl(
+  recoveryUrl: string,
+  discountCode?: string,
+): string {
+  if (!discountCode) return recoveryUrl;
+  try {
+    const parsed = new URL(recoveryUrl);
+    const suffix = abandonedRecoveryButtonSuffix(recoveryUrl, discountCode);
+    return new URL(`/${suffix}`, parsed.origin).toString();
+  } catch {
+    return recoveryUrl;
+  }
 }
 
 export function abandonedRecoveryButtonSuffix(
@@ -3584,7 +3915,46 @@ async function initializeDatabase(env: Bindings): Promise<void> {
         phone TEXT NOT NULL DEFAULT '',
         status TEXT NOT NULL DEFAULT 'sent',
         status_timestamp INTEGER,
+        error_code TEXT NOT NULL DEFAULT '',
+        error_message TEXT NOT NULL DEFAULT '',
         updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )
+    `),
+    env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS abandoned_message_events (
+        message_id TEXT PRIMARY KEY,
+        checkout_token TEXT NOT NULL,
+        phone TEXT NOT NULL DEFAULT '',
+        stage INTEGER NOT NULL,
+        template_name TEXT NOT NULL,
+        tracking_token TEXT UNIQUE,
+        destination_url TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'sent',
+        error_code TEXT NOT NULL DEFAULT '',
+        error_message TEXT NOT NULL DEFAULT '',
+        sent_at INTEGER NOT NULL,
+        delivered_at INTEGER,
+        read_at INTEGER,
+        clicked_at INTEGER,
+        purchased_at INTEGER,
+        updated_at INTEGER NOT NULL
+      )
+    `),
+    env.DB.prepare(`
+      CREATE INDEX IF NOT EXISTS idx_abandoned_message_checkout
+      ON abandoned_message_events(checkout_token, stage)
+    `),
+    env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS shopify_cart_events (
+        cart_token TEXT PRIMARY KEY,
+        status TEXT NOT NULL DEFAULT 'active',
+        item_count INTEGER NOT NULL DEFAULT 0,
+        total_price REAL NOT NULL DEFAULT 0,
+        currency TEXT NOT NULL DEFAULT 'INR',
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        checkout_started_at INTEGER,
+        purchased_at INTEGER
       )
     `),
     env.DB.prepare(`
@@ -3725,6 +4095,8 @@ async function initializeDatabase(env: Bindings): Promise<void> {
     "ALTER TABLE whatsapp_order_drafts ADD COLUMN mobile_phone TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE conversations ADD COLUMN delivery_status TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE conversations ADD COLUMN status_updated_at TEXT",
+    "ALTER TABLE whatsapp_message_statuses ADD COLUMN error_code TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE whatsapp_message_statuses ADD COLUMN error_message TEXT NOT NULL DEFAULT ''",
   ]) {
     try {
       await env.DB.prepare(statement).run();
@@ -5357,6 +5729,7 @@ function adminInboxHtml(): string {
     .placeholder{flex:1;display:grid;place-items:center;text-align:center;color:#667781;padding:30px}.placeholder h2{color:#41525d;font-weight:400}
     .messages{flex:1;min-height:0;overflow-y:auto;overscroll-behavior:contain;touch-action:pan-y;-webkit-overflow-scrolling:touch;padding:22px 7%;background-color:#efeae2;background-image:radial-gradient(rgba(17,24,39,.035) 1px,transparent 1px);background-size:18px 18px;display:none}
     .row{display:flex;margin:4px 0}.row.in{justify-content:flex-start}.row.out{justify-content:flex-end}.bubble{max-width:min(70%,720px);padding:7px 9px 5px;border-radius:8px;box-shadow:0 1px 1px rgba(0,0,0,.12);white-space:pre-wrap;overflow-wrap:anywhere;font-size:14px;line-height:1.42}.in .bubble{background:#fff;border-top-left-radius:2px}.out .bubble{background:#d9fdd3;border-top-right-radius:2px}.msg-meta{display:flex;justify-content:flex-end;align-items:center;gap:4px;color:#667781;font-size:10px;margin-top:3px}.ticks{font-size:15px;line-height:10px;letter-spacing:-5px;padding-right:5px;color:#8696a0}.ticks.read{color:#53bdeb}.ticks.failed{color:#e5484d;letter-spacing:0;padding-right:0}
+    .cta{display:block;margin:8px -9px -5px;padding:10px 12px;border-top:1px solid rgba(0,0,0,.08);text-align:center;color:#027eb5;text-decoration:none;font-weight:700;background:rgba(255,255,255,.48);border-radius:0 0 8px 8px}.cta.disabled{color:#667781;pointer-events:none}.trackline{display:flex;flex-wrap:wrap;gap:5px;margin-top:7px}.track-pill{font-size:10px;padding:3px 6px;border-radius:9px;background:#eef2f4;color:#54656f}.track-pill.good{background:#d8fdd2;color:#087b62}.track-pill.bad{background:#ffe5e5;color:#b42318}
     .composer{display:none;flex-shrink:0;position:sticky;bottom:0;z-index:2;background:#f0f2f5;padding:10px 14px;padding-bottom:max(10px,env(safe-area-inset-bottom));gap:10px;align-items:flex-end}.composer textarea{flex:1;resize:none;max-height:120px;min-height:42px;border:0;border-radius:9px;padding:11px 13px;font:inherit;outline:none}.composer button{height:42px;border:0;border-radius:50%;width:42px;background:#00a884;color:#fff;font-size:18px;cursor:pointer}.composer button:disabled{opacity:.5}.status{position:fixed;right:18px;bottom:18px;background:#111827;color:#fff;padding:10px 14px;border-radius:8px;font-size:13px;display:none;z-index:10}
     @media(max-width:760px){.app{display:block}.sidebar,.main{height:100vh}.main{display:none}.app.open-chat .sidebar{display:none}.app.open-chat .main{display:flex}.back{display:block}.messages{padding:18px 10px}.bubble{max-width:88%}}
   </style>
@@ -5464,9 +5837,13 @@ function adminInboxHtml(): string {
           var bubble=document.createElement('div');bubble.className='bubble';var body=document.createElement('div');
           var raw=String(message.body || '');var imageMatch=raw.match(/^\\[image:(https:\\/\\/[^\\]]+)\\]\\s*/);
           if(imageMatch){var image=document.createElement('img');image.src=imageMatch[1];image.alt='Product image';image.loading='lazy';image.style.cssText='display:block;max-width:100%;max-height:320px;border-radius:7px;margin-bottom:7px;object-fit:cover';bubble.appendChild(image);raw=raw.slice(imageMatch[0].length)}
+          var hasCheckoutButton=/\n*\[Button: Complete Your Order\]\s*$/.test(raw);raw=raw.replace(/\n*\[Button: Complete Your Order\]\s*$/,'');
           body.textContent=raw;var meta=document.createElement('span');meta.className='msg-meta';var time=document.createElement('span');time.textContent=formatMessageTime(message.created_at);meta.appendChild(time);
           if(message.direction==='out'){var status=String(message.delivery_status||'sent');var ticks=document.createElement('span');ticks.className='ticks '+status;ticks.title=status.charAt(0).toUpperCase()+status.slice(1);ticks.textContent=status==='failed'?'!':(status==='sent'?'✓':'✓✓');meta.appendChild(ticks)}
-          bubble.appendChild(body);bubble.appendChild(meta);row.appendChild(bubble);messages.appendChild(row);
+          bubble.appendChild(body);
+          if(hasCheckoutButton){var cta=document.createElement('a');cta.className='cta'+(message.destination_url?'':' disabled');cta.textContent='Complete Your Order';if(message.destination_url){cta.href=message.destination_url;cta.target='_blank';cta.rel='noopener noreferrer'}bubble.appendChild(cta)}
+          if(message.abandoned_stage){var tracking=document.createElement('div');tracking.className='trackline';[['Reminder '+message.abandoned_stage,''],[message.delivery_status||'sent',message.delivery_status==='failed'?'bad':''],[message.clicked_at?'Clicked':'Not clicked',message.clicked_at?'good':''],[message.purchased_at?'Purchased':'Not purchased',message.purchased_at?'good':'']].forEach(function(item){var pill=document.createElement('span');pill.className='track-pill '+item[1];pill.textContent=item[0];tracking.appendChild(pill)});if(message.error_message){tracking.title=message.error_message}bubble.appendChild(tracking)}
+          bubble.appendChild(meta);row.appendChild(bubble);messages.appendChild(row);
         });
         if(scroll) messages.scrollTop=messages.scrollHeight;
       }catch(error){showStatus(error.message)}finally{loadingMessages=false}
@@ -5537,4 +5914,5 @@ export default {
     ctx.waitUntil(runAbandonedAutomation(env));
   },
 } satisfies ExportedHandler<Bindings>;
+
 
