@@ -4,6 +4,7 @@ import {
   abandonedRecoveryButtonSuffix,
   allOrderVariants,
   buildAbandonedTemplatePayload,
+  buildSupportOwnerAlert,
   buildWhatsAppFlowPayload,
   canonicalOrderStep,
   deliveryStatusRank,
@@ -11,11 +12,13 @@ import {
   extractWhatsAppFlowSubmission,
   extractWhatsAppMessageId,
   IG_STORE_FLOW_ID,
+  IG_STORE_FLOW_RESULT_SCREENS,
   extractOrderNumber,
   isAngryMessage,
   nextAbandonedReminderAt,
   parseIndianMobile,
   requiresHumanSupport,
+  welcomeMessage,
 } from "../../src/index";
 import { repairMojibake } from "../../src/entry";
 
@@ -266,6 +269,40 @@ describe("priority WhatsApp flows", () => {
     });
   });
 
+  it("accepts each customer-specific Flow result screen", () => {
+    expect(IG_STORE_FLOW_RESULT_SCREENS).toContain("IG_STORE_SHOP");
+    expect(IG_STORE_FLOW_RESULT_SCREENS).toContain("IG_STORE_TRACK");
+    expect(IG_STORE_FLOW_RESULT_SCREENS).toContain("IG_STORE_SUPPORT");
+    expect(extractWhatsAppFlowSubmission({
+      type: "interactive",
+      interactive: {
+        nfm_reply: {
+          response_json: JSON.stringify({
+            screen: "IG_STORE_SUPPORT",
+            request_type: "support",
+            customer_name: "Asha",
+            mobile_number: "9876543210",
+            details: "Product arrived damaged",
+          }),
+        },
+      },
+    })?.requestType).toBe("support");
+  });
+
+  it("builds the support alert for the IG Store owner", () => {
+    const alert = buildSupportOwnerAlert("919876543210", "whatsapp_flow_customer_support", {
+      requestType: "support",
+      customerName: "Asha Sharma",
+      mobileNumber: "9876543210",
+      orderNumber: "#4897",
+      details: "Product arrived damaged",
+    });
+    expect(alert).toContain("IG Store customer needs support");
+    expect(alert).toContain("Customer WhatsApp: +919876543210");
+    expect(alert).toContain("Order: #4897");
+    expect(alert).toContain("Product arrived damaged");
+  });
+
   it("rejects malformed or unrelated Flow responses", () => {
     expect(extractWhatsAppFlowSubmission({
       type: "interactive",
@@ -308,6 +345,15 @@ describe("priority WhatsApp flows", () => {
         },
       },
     });
+    expect(payload.interactive.body.text).not.toContain("Main Menu");
+    expect(payload.interactive.action.parameters.flow_cta).toBe("Open IG Store");
+  });
+
+  it("does not embed the old numbered menu in the welcome message", () => {
+    const welcome = welcomeMessage("both");
+    expect(welcome).toContain("Open IG Store");
+    expect(welcome).not.toContain("Main Menu");
+    expect(welcome).not.toContain("1. Personalized Gifts");
   });
 });
 

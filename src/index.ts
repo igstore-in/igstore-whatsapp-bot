@@ -29,6 +29,7 @@ type Bindings = {
   ADMIN_USERNAME?: string;
   ADMIN_PASSWORD?: string;
   WHATSAPP_CATALOG_ID?: string;
+  SUPPORT_ALERT_PHONE?: string;
   // Live Shopify Admin lookup fallback. Use either a static Admin API token
   // (legacy/admin-created app) OR Client ID + Client Secret (Dev Dashboard app).
   SHOPIFY_ADMIN_DOMAIN?: string;
@@ -167,6 +168,7 @@ let lastShopifyWebhookEnsureAt = 0;
 
 const DEFAULT_SHOP_DOMAIN = "https://igstore.in";
 const SUPPORT_PHONE = "+91 95876 66693";
+const DEFAULT_SUPPORT_ALERT_PHONE = "919587666693";
 const ABANDONED_DELAY_MINUTES = 45;
 const ABANDONED_MINIMUM_AMOUNT = 0;
 const ABANDONED_FIRST_DELAY_MINUTES = 45;
@@ -194,6 +196,15 @@ const DEFAULT_FALLBACK_IMAGE =
 const DEFAULT_OPENAI_MODEL = "gpt-5-mini";
 export const IG_STORE_FLOW_ID = "1068611185637149";
 const IG_STORE_FLOW_SCREEN = "IG_STORE_HELP";
+export const IG_STORE_FLOW_RESULT_SCREENS = [
+  "IG_STORE_HELP",
+  "IG_STORE_SHOP",
+  "IG_STORE_CUSTOM",
+  "IG_STORE_TRACK",
+  "IG_STORE_PAYMENT",
+  "IG_STORE_SUPPORT",
+  "IG_STORE_FEEDBACK",
+] as const;
 
 const MASTER_SYSTEM_PROMPT = `
 à¤†à¤ª IG Store à¤•à¥‡ official WhatsApp Shopping Assistant à¤¹à¥ˆà¤‚à¥¤ à¤†à¤ªà¤•à¤¾ à¤¨à¤¾à¤® IG Store Gift Assistant à¤¹à¥ˆà¥¤
@@ -264,10 +275,16 @@ app.get("/health", (c) =>
     whatsappFlow: {
       id: IG_STORE_FLOW_ID,
       screen: IG_STORE_FLOW_SCREEN,
+      resultScreens: IG_STORE_FLOW_RESULT_SCREENS.length - 1,
       responseHandler: "interactive.nfm_reply",
     },
     integrations: {
       database: true,
+      supportAlerts: Boolean(
+        normalizeWhatsAppPhone(
+          c.env.SUPPORT_ALERT_PHONE?.trim() || DEFAULT_SUPPORT_ALERT_PHONE,
+        ),
+      ),
       shopify: Boolean(
         shopifyAdminDomain(c.env) &&
           (c.env.SHOPIFY_ADMIN_ACCESS_TOKEN?.trim() ||
@@ -774,6 +791,10 @@ async function processMessage(env: Bindings, message: any): Promise<void> {
       env,
       from,
       isAngryMessage(normalized) ? "angry_customer" : humanHandoffReason(normalized),
+      {
+        eventKey: `support-owner:${messageId}`,
+        details: text,
+      },
     );
     await replyAndLog(
       env,
@@ -787,7 +808,6 @@ async function processMessage(env: Bindings, message: any): Promise<void> {
   if (selectedLanguage) {
     await setUserLanguage(env, from, selectedLanguage);
     await replyAndLog(env, from, languageConfirmation(selectedLanguage));
-    await replyAndLog(env, from, mainMenu(selectedLanguage));
     await sendFlowLauncherAndLog(env, from);
     return;
   }
@@ -801,13 +821,15 @@ async function processMessage(env: Bindings, message: any): Promise<void> {
   }
 
   if (isGreeting(normalized) || isMenuCommand(normalized)) {
-    await replyAndLog(env, from, mainMenu(user.language));
     await sendFlowLauncherAndLog(env, from);
     return;
   }
 
   if (isSupportCommand(normalized) || normalized === "9") {
-    await createHumanHandoff(env, from, "customer_requested_support");
+    await createHumanHandoff(env, from, "customer_requested_support", {
+      eventKey: `support-owner:${messageId}`,
+      details: text,
+    });
     await replyAndLog(env, from, humanHandoffMessage(user.language, false));
     return;
   }
@@ -1035,7 +1057,12 @@ export function extractWhatsAppFlowSubmission(
   if (!response || typeof response !== "object" || Array.isArray(response)) return null;
 
   const screen = safeFlowField(response.screen, 80);
-  if (screen && screen !== IG_STORE_FLOW_SCREEN) return null;
+  if (
+    screen &&
+    !IG_STORE_FLOW_RESULT_SCREENS.includes(
+      screen as (typeof IG_STORE_FLOW_RESULT_SCREENS)[number],
+    )
+  ) return null;
 
   const requestType = safeFlowField(response.request_type, 40);
   if (!["shop", "custom", "track", "payment", "support", "feedback"].includes(requestType)) {
@@ -1154,7 +1181,14 @@ async function handleWhatsAppFlowSubmission(
   }
 
   if (submission.requestType === "payment") {
-    await createHumanHandoff(env, phone, "whatsapp_flow_payment_help");
+    await createHumanHandoff(env, phone, "whatsapp_flow_payment_help", {
+      eventKey: `support-owner:${messageId}`,
+      requestType: submission.requestType,
+      customerName: submission.customerName,
+      mobileNumber: submission.mobileNumber,
+      orderNumber: submission.orderNumber,
+      details: submission.details,
+    });
     await replyAndLog(
       env,
       phone,
@@ -1166,7 +1200,14 @@ async function handleWhatsAppFlowSubmission(
   }
 
   if (submission.requestType === "support") {
-    await createHumanHandoff(env, phone, "whatsapp_flow_customer_support");
+    await createHumanHandoff(env, phone, "whatsapp_flow_customer_support", {
+      eventKey: `support-owner:${messageId}`,
+      requestType: submission.requestType,
+      customerName: submission.customerName,
+      mobileNumber: submission.mobileNumber,
+      orderNumber: submission.orderNumber,
+      details: submission.details,
+    });
     await replyAndLog(
       env,
       phone,
@@ -1198,6 +1239,14 @@ async function handleWhatsAppFlowSubmission(
       submission.requestType === "custom"
         ? "whatsapp_flow_custom_product"
         : "whatsapp_flow_product_not_found",
+      {
+        eventKey: `support-owner:${messageId}`,
+        requestType: submission.requestType,
+        customerName: submission.customerName,
+        mobileNumber: submission.mobileNumber,
+        orderNumber: submission.orderNumber,
+        details: submission.details,
+      },
     );
     await replyAndLog(
       env,
@@ -1313,6 +1362,7 @@ async function createHumanHandoff(
   env: Bindings,
   phone: string,
   reason: string,
+  alert?: SupportOwnerAlertContext,
 ): Promise<void> {
   const priority =
     reason === "angry_customer" || reason === "legal_complaint" ? 2 : 1;
@@ -1328,6 +1378,81 @@ async function createHumanHandoff(
   `)
     .bind(phone, reason.slice(0, 80), priority)
     .run();
+
+  if (alert) {
+    await notifySupportOwner(env, phone, reason, alert);
+  }
+}
+
+type SupportOwnerAlertContext = {
+  eventKey: string;
+  requestType?: WhatsAppFlowSubmission["requestType"];
+  customerName?: string;
+  mobileNumber?: string;
+  orderNumber?: string;
+  details?: string;
+};
+
+export function buildSupportOwnerAlert(
+  customerPhone: string,
+  reason: string,
+  context: Omit<SupportOwnerAlertContext, "eventKey"> = {},
+): string {
+  const customerWhatsApp =
+    normalizeWhatsAppPhone(customerPhone) ?? customerPhone.replace(/\D/g, "");
+  const submittedMobile = normalizeWhatsAppPhone(context.mobileNumber ?? "");
+  const typeLabels: Partial<Record<WhatsAppFlowSubmission["requestType"], string>> = {
+    payment: "Payment / checkout help",
+    support: "Customer support",
+    custom: "Custom product help",
+    shop: "Product help",
+  };
+
+  return [
+    "🔔 IG Store customer needs support",
+    context.customerName ? `Name: ${context.customerName}` : "",
+    customerWhatsApp ? `Customer WhatsApp: +${customerWhatsApp}` : "",
+    submittedMobile && submittedMobile !== customerWhatsApp
+      ? `Submitted mobile: +${submittedMobile}`
+      : "",
+    `Request: ${context.requestType
+      ? typeLabels[context.requestType] ?? context.requestType
+      : reason.replace(/_/g, " ")}`,
+    context.orderNumber ? `Order: ${context.orderNumber}` : "",
+    context.details ? `Details: ${context.details.slice(0, 700)}` : "",
+    "Please reply to the customer from the IG Store inbox.",
+  ].filter(Boolean).join("\n");
+}
+
+async function notifySupportOwner(
+  env: Bindings,
+  customerPhone: string,
+  reason: string,
+  context: SupportOwnerAlertContext,
+): Promise<void> {
+  const ownerPhone = normalizeWhatsAppPhone(
+    env.SUPPORT_ALERT_PHONE?.trim() || DEFAULT_SUPPORT_ALERT_PHONE,
+  );
+  if (!ownerPhone) {
+    console.error("Support owner alert skipped: invalid SUPPORT_ALERT_PHONE");
+    return;
+  }
+
+  const body = buildSupportOwnerAlert(customerPhone, reason, context);
+  try {
+    await sendNotificationOnce(
+      env,
+      context.eventKey,
+      ownerPhone,
+      "support_owner_alert",
+      async () => {
+        const messageId = await sendText(env, ownerPhone, body);
+        await saveConversation(env, ownerPhone, "out", body, messageId);
+      },
+    );
+  } catch (error) {
+    console.error("Support owner WhatsApp alert failed:", error);
+  }
 }
 
 function paymentSafetyMessage(language: Language): string {
@@ -1888,16 +2013,16 @@ function shopDomain(env: Pick<Bindings, "SHOP_DOMAIN">): string {
   return raw.replace(/\/$/, "");
 }
 
-function welcomeMessage(language: Language): string {
+export function welcomeMessage(language: Language): string {
   if (language === "en") {
-    return `Welcome to *IG Store* ðŸŽ\nPersonalized gifts, custom name plates, neon signs and home decor.\n\nChoose language anytime:\n*English* | *à¤¹à¤¿à¤‚à¤¦à¥€* | *Both*\n\n${mainMenu("en")}`;
+    return "Welcome to *IG Store* 🎁\nShop personalised gifts, create a custom order, track an order or contact support.\n\nTap *Open IG Store* below.";
   }
 
   if (language === "hi") {
-    return `*IG Store* à¤®à¥‡à¤‚ à¤†à¤ªà¤•à¤¾ à¤¸à¥à¤µà¤¾à¤—à¤¤ à¤¹à¥ˆ ðŸŽ\nà¤ªà¤°à¥à¤¸à¤¨à¤²à¤¾à¤‡à¤œà¤¼à¥à¤¡ à¤—à¤¿à¤«à¥à¤Ÿà¥à¤¸, à¤•à¤¸à¥à¤Ÿà¤® à¤¨à¥‡à¤® à¤ªà¥à¤²à¥‡à¤Ÿ, à¤¨à¤¿à¤¯à¥‹à¤¨ à¤¸à¤¾à¤‡à¤¨ à¤”à¤° à¤¹à¥‹à¤® à¤¡à¥‡à¤•à¥‹à¤°à¥¤\n\nà¤­à¤¾à¤·à¤¾ à¤¬à¤¦à¤²à¤¨à¥‡ à¤•à¥‡ à¤²à¤¿à¤ à¤²à¤¿à¤–à¥‡à¤‚:\n*English* | *à¤¹à¤¿à¤‚à¤¦à¥€* | *Both*\n\n${mainMenu("hi")}`;
+    return "*IG Store* में आपका स्वागत है 🎁\nपर्सनलाइज़्ड गिफ्ट खरीदें, कस्टम ऑर्डर बनाएं, ऑर्डर ट्रैक करें या सपोर्ट लें।\n\nनीचे *Open IG Store* दबाएं।";
   }
 
-  return `Welcome to *IG Store* ðŸŽ\n*IG Store* à¤®à¥‡à¤‚ à¤†à¤ªà¤•à¤¾ à¤¸à¥à¤µà¤¾à¤—à¤¤ à¤¹à¥ˆà¥¤\n\nChoose language / à¤­à¤¾à¤·à¤¾ à¤šà¥à¤¨à¥‡à¤‚:\n*English* | *à¤¹à¤¿à¤‚à¤¦à¥€* | *Both*\n\n${mainMenu("both")}`;
+  return "Welcome to *IG Store* 🎁\nGift shopping, custom order, tracking aur support ke liye neeche *Open IG Store* button dabayein.";
 }
 
 function mainMenu(language: Language): string {
@@ -3175,9 +3300,9 @@ export function buildWhatsAppFlowPayload(
       type: "flow",
       header: { type: "text", text: "IG Store" },
       body: {
-        text: "Shop gifts, personalise an item, track your order or get support—inside WhatsApp.",
+        text: "Shop gifts, create a custom order, track your order or contact support.",
       },
-      footer: { text: "Secure help from IG Store" },
+      footer: { text: "Fast and simple help inside WhatsApp" },
       action: {
         name: "flow",
         parameters: {
@@ -3294,7 +3419,16 @@ async function sendFlowLauncherAndLog(env: Bindings, phone: string): Promise<voi
     const messageId = await sendWhatsAppFlowLauncher(env, phone);
     await saveConversation(env, phone, "out", body, messageId);
   } catch (error) {
-    console.error("WhatsApp Flow launcher failed; text menu remains available", error);
+    console.error("WhatsApp Flow launcher failed", error);
+    try {
+      await replyAndLog(
+        env,
+        phone,
+        "IG Store button abhi open nahi hua. Kripya *SHOP*, *TRACK* ya *SUPPORT* likhein.",
+      );
+    } catch (fallbackError) {
+      console.error("WhatsApp Flow fallback message failed", fallbackError);
+    }
   }
 }
 
