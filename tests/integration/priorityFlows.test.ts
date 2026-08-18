@@ -4,10 +4,13 @@ import {
   abandonedRecoveryButtonSuffix,
   allOrderVariants,
   buildAbandonedTemplatePayload,
+  buildWhatsAppFlowPayload,
   canonicalOrderStep,
   deliveryStatusRank,
   extractMessageStatuses,
+  extractWhatsAppFlowSubmission,
   extractWhatsAppMessageId,
+  IG_STORE_FLOW_ID,
   extractOrderNumber,
   isAngryMessage,
   nextAbandonedReminderAt,
@@ -231,6 +234,80 @@ describe("priority WhatsApp flows", () => {
     expect(extractWhatsAppMessageId(JSON.stringify({ messages: [{ id: "wamid.123" }] })))
       .toBe("wamid.123");
     expect(extractWhatsAppMessageId("not-json")).toBeNull();
+  });
+
+  it("parses the published IG Store WhatsApp Flow response", () => {
+    expect(IG_STORE_FLOW_ID).toBe("1068611185637149");
+    expect(extractWhatsAppFlowSubmission({
+      type: "interactive",
+      interactive: {
+        type: "nfm_reply",
+        nfm_reply: {
+          response_json: JSON.stringify({
+            screen: "IG_STORE_HELP",
+            flow_token: "customer-session-1",
+            request_type: "track",
+            product_category: "name_plate",
+            customer_name: "Asha Sharma",
+            mobile_number: "+91 98765 43210",
+            order_number: "#4897",
+            details: "Please share current delivery status",
+          }),
+        },
+      },
+    })).toEqual({
+      requestType: "track",
+      productCategory: "name_plate",
+      customerName: "Asha Sharma",
+      mobileNumber: "+91 98765 43210",
+      orderNumber: "#4897",
+      details: "Please share current delivery status",
+      flowToken: "customer-session-1",
+    });
+  });
+
+  it("rejects malformed or unrelated Flow responses", () => {
+    expect(extractWhatsAppFlowSubmission({
+      type: "interactive",
+      interactive: { nfm_reply: { response_json: "not-json" } },
+    })).toBeNull();
+    expect(extractWhatsAppFlowSubmission({
+      type: "interactive",
+      interactive: {
+        nfm_reply: {
+          response_json: JSON.stringify({
+            screen: "ANOTHER_FLOW",
+            request_type: "shop",
+          }),
+        },
+      },
+    })).toBeNull();
+  });
+
+  it("builds the WhatsApp button that opens the published Flow", () => {
+    const payload = buildWhatsAppFlowPayload(
+      "919876543210",
+      "igstore_customer_session_1",
+    ) as any;
+    expect(payload).toMatchObject({
+      messaging_product: "whatsapp",
+      to: "919876543210",
+      type: "interactive",
+      interactive: {
+        type: "flow",
+        action: {
+          name: "flow",
+          parameters: {
+            flow_message_version: "3",
+            flow_token: "igstore_customer_session_1",
+            flow_id: "1068611185637149",
+            flow_cta: "Open IG Store",
+            flow_action: "navigate",
+            flow_action_payload: { screen: "IG_STORE_HELP" },
+          },
+        },
+      },
+    });
   });
 });
 
