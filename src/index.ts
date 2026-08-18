@@ -4102,6 +4102,18 @@ async function initializeDatabase(env: Bindings): Promise<void> {
     "ALTER TABLE conversations ADD COLUMN status_updated_at TEXT",
     "ALTER TABLE whatsapp_message_statuses ADD COLUMN error_code TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE whatsapp_message_statuses ADD COLUMN error_message TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE abandoned_message_events ADD COLUMN phone TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE abandoned_message_events ADD COLUMN template_name TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE abandoned_message_events ADD COLUMN tracking_token TEXT",
+    "ALTER TABLE abandoned_message_events ADD COLUMN destination_url TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE abandoned_message_events ADD COLUMN error_code TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE abandoned_message_events ADD COLUMN error_message TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE abandoned_message_events ADD COLUMN sent_at INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE abandoned_message_events ADD COLUMN delivered_at INTEGER",
+    "ALTER TABLE abandoned_message_events ADD COLUMN read_at INTEGER",
+    "ALTER TABLE abandoned_message_events ADD COLUMN clicked_at INTEGER",
+    "ALTER TABLE abandoned_message_events ADD COLUMN purchased_at INTEGER",
+    "ALTER TABLE abandoned_message_events ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0",
   ]) {
     try {
       await env.DB.prepare(statement).run();
@@ -4109,6 +4121,11 @@ async function initializeDatabase(env: Bindings): Promise<void> {
       if (!String(error).toLowerCase().includes("duplicate column")) throw error;
     }
   }
+  await env.DB.prepare(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_abandoned_message_tracking_token
+    ON abandoned_message_events(tracking_token)
+    WHERE tracking_token IS NOT NULL
+  `).run();
 }
 
 async function saveLastProductSuggestions(
