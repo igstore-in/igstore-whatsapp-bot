@@ -20,6 +20,10 @@ CREATE TABLE IF NOT EXISTS abandoned_message_events (
 CREATE INDEX IF NOT EXISTS idx_abandoned_message_checkout
 ON abandoned_message_events(checkout_token, stage);
 
+CREATE UNIQUE INDEX IF NOT EXISTS idx_abandoned_message_tracking_token
+ON abandoned_message_events(tracking_token)
+WHERE tracking_token IS NOT NULL;
+
 CREATE TABLE IF NOT EXISTS shopify_cart_events (
   cart_token TEXT PRIMARY KEY,
   status TEXT NOT NULL DEFAULT 'active',
