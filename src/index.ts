@@ -30,6 +30,7 @@ type Bindings = {
   ADMIN_PASSWORD?: string;
   WHATSAPP_CATALOG_ID?: string;
   SUPPORT_ALERT_PHONE?: string;
+  SUPPORT_ALERT_TEMPLATE_NAME?: string;
   // Live Shopify Admin lookup fallback. Use either a static Admin API token
   // (legacy/admin-created app) OR Client ID + Client Secret (Dev Dashboard app).
   SHOPIFY_ADMIN_DOMAIN?: string;
@@ -169,6 +170,7 @@ let lastShopifyWebhookEnsureAt = 0;
 const DEFAULT_SHOP_DOMAIN = "https://igstore.in";
 const SUPPORT_PHONE = "+91 95876 66693";
 const DEFAULT_SUPPORT_ALERT_PHONE = "919587666693";
+const DEFAULT_SUPPORT_ALERT_TEMPLATE = "ig_support_owner_alert";
 const ABANDONED_DELAY_MINUTES = 45;
 const ABANDONED_MINIMUM_AMOUNT = 0;
 const ABANDONED_FIRST_DELAY_MINUTES = 45;
@@ -285,6 +287,8 @@ app.get("/health", (c) =>
           c.env.SUPPORT_ALERT_PHONE?.trim() || DEFAULT_SUPPORT_ALERT_PHONE,
         ),
       ),
+      supportAlertTemplate:
+        c.env.SUPPORT_ALERT_TEMPLATE_NAME?.trim() || DEFAULT_SUPPORT_ALERT_TEMPLATE,
       shopify: Boolean(
         shopifyAdminDomain(c.env) &&
           (c.env.SHOPIFY_ADMIN_ACCESS_TOKEN?.trim() ||
@@ -1401,12 +1405,7 @@ export function buildSupportOwnerAlert(
   const customerWhatsApp =
     normalizeWhatsAppPhone(customerPhone) ?? customerPhone.replace(/\D/g, "");
   const submittedMobile = normalizeWhatsAppPhone(context.mobileNumber ?? "");
-  const typeLabels: Partial<Record<WhatsAppFlowSubmission["requestType"], string>> = {
-    payment: "Payment / checkout help",
-    support: "Customer support",
-    custom: "Custom product help",
-    shop: "Product help",
-  };
+  const requestLabel = supportOwnerRequestLabel(reason, context.requestType);
 
   return [
     "🔔 IG Store customer needs support",
@@ -1415,13 +1414,42 @@ export function buildSupportOwnerAlert(
     submittedMobile && submittedMobile !== customerWhatsApp
       ? `Submitted mobile: +${submittedMobile}`
       : "",
-    `Request: ${context.requestType
-      ? typeLabels[context.requestType] ?? context.requestType
-      : reason.replace(/_/g, " ")}`,
+    `Request: ${requestLabel}`,
     context.orderNumber ? `Order: ${context.orderNumber}` : "",
     context.details ? `Details: ${context.details.slice(0, 700)}` : "",
     "Please reply to the customer from the IG Store inbox.",
   ].filter(Boolean).join("\n");
+}
+
+function supportOwnerRequestLabel(
+  reason: string,
+  requestType?: WhatsAppFlowSubmission["requestType"],
+): string {
+  const typeLabels: Partial<Record<WhatsAppFlowSubmission["requestType"], string>> = {
+    payment: "Payment / checkout help",
+    support: "Customer support",
+    custom: "Custom product help",
+    shop: "Product help",
+  };
+  return requestType
+    ? typeLabels[requestType] ?? requestType
+    : reason.replace(/_/g, " ");
+}
+
+export function supportOwnerAlertParameters(
+  customerPhone: string,
+  reason: string,
+  context: Omit<SupportOwnerAlertContext, "eventKey"> = {},
+): string[] {
+  const customerWhatsApp =
+    normalizeWhatsAppPhone(customerPhone) ?? customerPhone.replace(/\D/g, "");
+  return [
+    context.customerName || "WhatsApp customer",
+    customerWhatsApp ? `+${customerWhatsApp}` : "Not available",
+    supportOwnerRequestLabel(reason, context.requestType),
+    context.orderNumber || "Not provided",
+    context.details?.slice(0, 700) || "Please review the IG Store inbox.",
+  ];
 }
 
 async function notifySupportOwner(
@@ -1439,16 +1467,20 @@ async function notifySupportOwner(
   }
 
   const body = buildSupportOwnerAlert(customerPhone, reason, context);
+  const parameters = supportOwnerAlertParameters(customerPhone, reason, context);
   try {
     await sendNotificationOnce(
       env,
       context.eventKey,
       ownerPhone,
       "support_owner_alert",
-      async () => {
-        const messageId = await sendText(env, ownerPhone, body);
-        await saveConversation(env, ownerPhone, "out", body, messageId);
-      },
+      () => sendTemplateOrWindowMessage(
+        env,
+        ownerPhone,
+        env.SUPPORT_ALERT_TEMPLATE_NAME?.trim() || DEFAULT_SUPPORT_ALERT_TEMPLATE,
+        parameters,
+        body,
+      ),
     );
   } catch (error) {
     console.error("Support owner WhatsApp alert failed:", error);

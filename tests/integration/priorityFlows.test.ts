@@ -18,6 +18,7 @@ import {
   nextAbandonedReminderAt,
   parseIndianMobile,
   requiresHumanSupport,
+  supportOwnerAlertParameters,
   welcomeMessage,
 } from "../../src/index";
 import { repairMojibake } from "../../src/entry";
@@ -301,6 +302,18 @@ describe("priority WhatsApp flows", () => {
     expect(alert).toContain("Customer WhatsApp: +919876543210");
     expect(alert).toContain("Order: #4897");
     expect(alert).toContain("Product arrived damaged");
+    expect(supportOwnerAlertParameters("919876543210", "whatsapp_flow_customer_support", {
+      requestType: "support",
+      customerName: "Asha Sharma",
+      orderNumber: "#4897",
+      details: "Product arrived damaged",
+    })).toEqual([
+      "Asha Sharma",
+      "+919876543210",
+      "Customer support",
+      "#4897",
+      "Product arrived damaged",
+    ]);
   });
 
   it("rejects malformed or unrelated Flow responses", () => {
