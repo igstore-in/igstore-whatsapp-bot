@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   ABANDONED_NEW_ONLY_SINCE,
+  adminInboxHtml,
   abandonedDestinationUrl,
   abandonedRecoveryButtonSuffix,
   allOrderVariants,
@@ -15,6 +16,8 @@ import {
   hasWhatsAppMarketingConsent,
   IG_STORE_FLOW_ID,
   IG_STORE_FLOW_RESULT_SCREENS,
+  configuredAbandonedNewOnlySince,
+  isPostPurchaseReengagementEnabled,
   extractOrderNumber,
   isAngryMessage,
   nextAbandonedReminderAt,
@@ -206,10 +209,31 @@ describe("priority WhatsApp flows", () => {
   });
 
   it("starts abandoned checkout targeting from the new-only rollout cutoff", () => {
-    expect(ABANDONED_NEW_ONLY_SINCE).toBe("2026-08-12T04:50:18.793Z");
+    expect(ABANDONED_NEW_ONLY_SINCE).toBe("2026-08-22T08:06:01.120Z");
     expect(Date.parse(ABANDONED_NEW_ONLY_SINCE)).toBeGreaterThan(
-      Date.parse("2026-08-12T00:00:00.000Z"),
+      Date.parse("2026-08-22T08:00:00.000Z"),
     );
+    expect(configuredAbandonedNewOnlySince("not-a-date")).toBe(
+      ABANDONED_NEW_ONLY_SINCE,
+    );
+    expect(configuredAbandonedNewOnlySince("2026-08-23T00:00:00Z")).toBe(
+      "2026-08-23T00:00:00.000Z",
+    );
+  });
+
+  it("keeps the old 30-day customer campaign off unless explicitly enabled", () => {
+    expect(isPostPurchaseReengagementEnabled()).toBe(false);
+    expect(isPostPurchaseReengagementEnabled("false")).toBe(false);
+    expect(isPostPurchaseReengagementEnabled("true")).toBe(true);
+  });
+
+  it("renders executable inbox JavaScript and a read-only refresh action", () => {
+    const html = adminInboxHtml();
+    const script = html.match(/<script>([\s\S]*)<\/script>/)?.[1];
+    expect(script).toBeTruthy();
+    expect(() => new Function(script!)).not.toThrow();
+    expect(html).toContain("Inbox refreshed");
+    expect(html).not.toContain("api('/admin/api/run-abandoned'");
   });
 
   it("extracts Meta read receipts and preserves WhatsApp status order", () => {

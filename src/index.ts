@@ -24,6 +24,8 @@ type Bindings = {
   ABANDONED_TRACKED_TEMPLATE_FIRST?: string;
   ABANDONED_TRACKED_TEMPLATE_SECOND?: string;
   ABANDONED_TRACKED_TEMPLATE_THIRD?: string;
+  ABANDONED_NEW_ONLY_SINCE?: string;
+  ENABLE_POST_PURCHASE_REENGAGEMENT?: string;
   ORDER_CONFIRMATION_TEMPLATE_NAME?: string;
   FULFILLMENT_TEMPLATE_NAME?: string;
   DELIVERY_FEEDBACK_TEMPLATE_NAME?: string;
@@ -187,8 +189,7 @@ const ABANDONED_MINIMUM_AMOUNT = 0;
 const ABANDONED_FIRST_DELAY_MINUTES = 45;
 const ABANDONED_SECOND_DELAY_MINUTES = 45 + 12 * 60;
 const ABANDONED_THIRD_DELAY_MINUTES = 45 + 12 * 60 + 24 * 60;
-export const ABANDONED_NEW_ONLY_SINCE = "2026-08-12T04:50:18.793Z";
-const ABANDONED_NEW_ONLY_SINCE_MS = Date.parse(ABANDONED_NEW_ONLY_SINCE);
+export const ABANDONED_NEW_ONLY_SINCE = "2026-08-22T08:06:01.120Z";
 const ABANDONED_SYNC_PAGE_SIZE = 100;
 const ABANDONED_SYNC_MAX_PAGES = 25;
 const ABANDONED_SEND_BATCH_SIZE = 10;
@@ -218,6 +219,17 @@ const DEFAULT_TEMPLATE_LANGUAGE = "en_US";
 const DEFAULT_FALLBACK_IMAGE =
   "https://cdn.shopify.com/s/files/1/0600/1383/8379/collections/best-sellers-collection.jpg?v=1783692206";
 const DEFAULT_OPENAI_MODEL = "gpt-5-mini";
+
+export function configuredAbandonedNewOnlySince(value?: string): string {
+  const parsed = Date.parse(String(value ?? "").trim());
+  return Number.isFinite(parsed)
+    ? new Date(parsed).toISOString()
+    : ABANDONED_NEW_ONLY_SINCE;
+}
+
+export function isPostPurchaseReengagementEnabled(value?: string): boolean {
+  return String(value ?? "").trim().toLowerCase() === "true";
+}
 export const IG_STORE_FLOW_ID = "1068611185637149";
 const IG_STORE_FLOW_SCREEN = "IG_STORE_HELP";
 export const IG_STORE_FLOW_RESULT_SCREENS = [
@@ -450,7 +462,10 @@ app.get("/shopify/health", async (c) => {
       { afterMinutes: ABANDONED_THIRD_DELAY_MINUTES, discount: "10%", code: ABANDONED_FINAL_OFFER_CODE },
     ],
     syncMode: "new-checkouts-only",
-    syncSince: ABANDONED_NEW_ONLY_SINCE,
+    syncSince: configuredAbandonedNewOnlySince(c.env.ABANDONED_NEW_ONLY_SINCE),
+    oldCustomerCampaignEnabled: isPostPurchaseReengagementEnabled(
+      c.env.ENABLE_POST_PURCHASE_REENGAGEMENT,
+    ),
     stopKeywordEnabled: true,
     minimumAmount: ABANDONED_MINIMUM_AMOUNT,
     counts: counts ?? {},
@@ -576,7 +591,26 @@ app.get("/admin/api/chats", async (c) => {
     LIMIT 200
   `).all();
 
-  return c.json({ ok: true, chats: result.results ?? [] });
+  const [abandoned, tracking] = await Promise.all([
+    abandonedCheckoutCounts(c.env),
+    abandonedMessageTrackingCounts(c.env),
+  ]);
+  const chats = result.results ?? [];
+
+  return c.json({
+    ok: true,
+    chats,
+    summary: {
+      customers: chats.length,
+      active: Number(abandoned.pending ?? 0),
+      reminders: Number(tracking.sent ?? 0),
+      read: Number(tracking.read ?? 0),
+      purchased: Number(tracking.purchased ?? 0),
+    },
+    newOnlySince: configuredAbandonedNewOnlySince(
+      c.env.ABANDONED_NEW_ONLY_SINCE,
+    ),
+  });
 });
 
 app.get("/admin/api/messages", async (c) => {
@@ -2452,7 +2486,11 @@ async function upsertAbandonedCheckout(env: Bindings, payload: any): Promise<voi
   let status = "pending";
   let skipReason: string | null = null;
 
-  if (activityAt < ABANDONED_NEW_ONLY_SINCE_MS) {
+  if (
+    activityAt < Date.parse(
+      configuredAbandonedNewOnlySince(env.ABANDONED_NEW_ONLY_SINCE),
+    )
+  ) {
     status = "stopped";
     skipReason = "legacy_checkout_before_new_only_cutoff";
   } else if (!phone) {
@@ -2814,7 +2852,10 @@ async function processDueAbandonedCheckouts(env: Bindings): Promise<void> {
     UPDATE abandoned_checkouts
     SET status = 'stopped', skip_reason = 'legacy_checkout_before_new_only_cutoff', updated_at = ?
     WHERE status IN ('pending', 'processing') AND created_at < ?
-  `).bind(now, ABANDONED_NEW_ONLY_SINCE_MS).run();
+  `).bind(
+    now,
+    Date.parse(configuredAbandonedNewOnlySince(env.ABANDONED_NEW_ONLY_SINCE)),
+  ).run();
 
   await env.DB.prepare(`
     UPDATE abandoned_checkouts
@@ -2950,7 +2991,9 @@ async function runAbandonedAutomation(
   await ensureShopifyWebhookSubscriptions(env, forceWebhookSetup);
   await syncAbandonedCheckoutsFromShopify(env);
   await processDueAbandonedCheckouts(env);
-  await processPostPurchaseAutomation(env);
+  if (isPostPurchaseReengagementEnabled(env.ENABLE_POST_PURCHASE_REENGAGEMENT)) {
+    await processPostPurchaseAutomation(env);
+  }
 }
 
 async function abandonedCheckoutCounts(env: Bindings): Promise<Record<string, number>> {
@@ -3135,7 +3178,9 @@ async function syncAbandonedCheckoutsFromShopify(env: Bindings): Promise<void> {
 
   try {
     let after: string | null = null;
-    const createdSince = ABANDONED_NEW_ONLY_SINCE;
+    const createdSince = configuredAbandonedNewOnlySince(
+      env.ABANDONED_NEW_ONLY_SINCE,
+    );
 
     for (let page = 0; page < ABANDONED_SYNC_MAX_PAGES; page += 1) {
       const response = await fetch(
@@ -5728,7 +5773,7 @@ function isAdminAuthorized(env: Bindings, authorization?: string): boolean {
   }
 }
 
-function adminInboxHtml(): string {
+export function adminInboxHtml(): string {
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -5741,7 +5786,8 @@ function adminInboxHtml(): string {
     .sidebar{border-right:1px solid #d8dde1;display:flex;flex-direction:column;min-width:0;min-height:0;background:#fff}
     .brand{height:68px;padding:12px 16px;background:#f0f2f5;display:flex;align-items:center;gap:12px;border-bottom:1px solid #d8dde1}
     .logo{width:42px;height:42px;border-radius:50%;background:#00a884;color:#fff;display:grid;place-items:center;font-weight:800}
-    .brand strong{display:block;font-size:17px}.brand small{color:#667781}.sync-form{margin-left:auto}.sync-form button{border:0;border-radius:7px;background:#00a884;color:#fff;padding:8px 10px;font-weight:700;cursor:pointer}
+    .brand strong{display:block;font-size:17px}.brand small{color:#667781}.sync-form{margin-left:auto}.sync-form button{border:0;border-radius:7px;background:#00a884;color:#fff;padding:8px 10px;font-weight:700;cursor:pointer}.sync-form button:disabled{opacity:.55}
+    .summary{display:grid;grid-template-columns:repeat(5,1fr);gap:6px;padding:9px 10px;background:#fff;border-bottom:1px solid #eef0f2}.summary-card{min-width:0;background:#f5f7f8;border-radius:8px;padding:7px 4px;text-align:center}.summary-card strong{display:block;color:#075e54;font-size:15px}.summary-card span{display:block;color:#667781;font-size:9px;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.cutoff{padding:6px 12px;background:#e7fce8;color:#087b62;font-size:11px;border-bottom:1px solid #d8efda;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
     .search{padding:10px 12px;background:#fff;border-bottom:1px solid #eef0f2}.search input{width:100%;border:0;background:#f0f2f5;border-radius:9px;padding:11px 14px;outline:none;font-size:14px}
     .chat-list{overflow-y:auto;overscroll-behavior:contain;-webkit-overflow-scrolling:touch;min-height:0;flex:1}.empty{padding:30px 18px;text-align:center;color:#667781}
     .chat-item{padding:12px 14px;display:grid;grid-template-columns:48px 1fr auto;gap:11px;cursor:pointer;border-bottom:1px solid #f0f2f5}.chat-item:hover,.chat-item.active{background:#f0f2f5}
@@ -5759,7 +5805,15 @@ function adminInboxHtml(): string {
 <body>
   <div class="app" id="app">
     <aside class="sidebar">
-      <div class="brand"><div class="logo">IG</div><div><strong>IG Store WhatsApp</strong><small>New checkouts only</small></div><div class="sync-form"><button id="syncButton" type="button">Sync new</button></div></div>
+      <div class="brand"><div class="logo">IG</div><div><strong>IG Store WhatsApp</strong><small id="lastRefresh">Live customer inbox</small></div><div class="sync-form"><button id="syncButton" type="button">Refresh</button></div></div>
+      <div class="summary" id="summary">
+        <div class="summary-card"><strong id="summaryCustomers">&mdash;</strong><span>Customers</span></div>
+        <div class="summary-card"><strong id="summaryActive">&mdash;</strong><span>Active</span></div>
+        <div class="summary-card"><strong id="summaryReminders">&mdash;</strong><span>Sent</span></div>
+        <div class="summary-card"><strong id="summaryRead">&mdash;</strong><span>Read</span></div>
+        <div class="summary-card"><strong id="summaryPurchased">&mdash;</strong><span>Bought</span></div>
+      </div>
+      <div class="cutoff" id="cutoff">Only new abandoned checkouts are eligible</div>
       <div class="search"><input id="search" placeholder="Search name or phone"></div>
       <div class="chat-list" id="chatList"><div class="empty">Loading conversationsâ€¦</div></div>
     </aside>
@@ -5769,7 +5823,7 @@ function adminInboxHtml(): string {
         <div class="avatar" id="headerAvatar">IG</div>
         <div class="details"><strong id="headerName">Select a customer</strong><small id="headerPhone">Chat history will appear here</small></div>
       </header>
-      <section class="placeholder" id="placeholder"><div><h2>IG Store WhatsApp Inbox</h2><p>Select a customer from the left to view messages.</p></div></section>
+      <section class="placeholder" id="placeholder"><div><h2>IG Store WhatsApp Inbox</h2><p>Loading the latest customer conversation&hellip;</p></div></section>
       <section class="messages" id="messages"></section>
       <form class="composer" id="composer"><textarea id="messageInput" rows="1" placeholder="Type a message"></textarea><button id="sendButton" type="submit">âž¤</button></form>
     </main>
@@ -5820,18 +5874,33 @@ function adminInboxHtml(): string {
       if(!response.ok || !data.ok) throw new Error(data.error || 'Request failed');
       return data;
     }
+    function updateSummary(summary, newOnlySince){
+      summary=summary||{};
+      document.getElementById('summaryCustomers').textContent=summary.customers||0;
+      document.getElementById('summaryActive').textContent=summary.active||0;
+      document.getElementById('summaryReminders').textContent=summary.reminders||0;
+      document.getElementById('summaryRead').textContent=summary.read||0;
+      document.getElementById('summaryPurchased').textContent=summary.purchased||0;
+      var cutoffDate=dateValue(newOnlySince);
+      document.getElementById('cutoff').textContent=cutoffDate
+        ? 'New-only protection active since '+cutoffDate.toLocaleString()
+        : 'New-only protection is active';
+      document.getElementById('lastRefresh').textContent='Updated '+new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
+    }
     async function loadChats(){
       try{
         var data = await api('/admin/api/chats');
         chats = data.chats || [];
+        updateSummary(data.summary, data.newOnlySince);
         renderChats();
-      }catch(error){chatList.innerHTML='';var e=document.createElement('div');e.className='empty';e.textContent=error.message;chatList.appendChild(e)}
+        if(!selectedPhone && chats.length && window.innerWidth>760) await selectChat(chats[0]);
+      }catch(error){chatList.innerHTML='';var e=document.createElement('div');e.className='empty';e.textContent='Inbox could not load. '+error.message;chatList.appendChild(e);document.getElementById('lastRefresh').textContent='Connection error'}
     }
     function renderChats(){
       var term = search.value.trim().toLowerCase();
       var filtered = chats.filter(function(chat){return String(chat.customer_name || '').toLowerCase().indexOf(term)>=0 || String(chat.phone || '').indexOf(term)>=0});
       chatList.innerHTML='';
-      if(!filtered.length){var e=document.createElement('div');e.className='empty';e.textContent='No conversations found';chatList.appendChild(e);return}
+      if(!filtered.length){var e=document.createElement('div');e.className='empty';e.textContent=term?'No matching customer found':'No customer messages yet';chatList.appendChild(e);return}
       filtered.forEach(function(chat){
         var item=document.createElement('div');item.className='chat-item'+(chat.phone===selectedPhone?' active':'');item.onclick=function(){selectChat(chat)};
         var avatar=document.createElement('div');avatar.className='avatar';avatar.textContent=initials(chat.customer_name);
@@ -5859,7 +5928,7 @@ function adminInboxHtml(): string {
           var bubble=document.createElement('div');bubble.className='bubble';var body=document.createElement('div');
           var raw=String(message.body || '');var imageMatch=raw.match(/^\\[image:(https:\\/\\/[^\\]]+)\\]\\s*/);
           if(imageMatch){var image=document.createElement('img');image.src=imageMatch[1];image.alt='Product image';image.loading='lazy';image.style.cssText='display:block;max-width:100%;max-height:320px;border-radius:7px;margin-bottom:7px;object-fit:cover';bubble.appendChild(image);raw=raw.slice(imageMatch[0].length)}
-          var hasCheckoutButton=/\n*\[Button: Complete Your Order\]\s*$/.test(raw);raw=raw.replace(/\n*\[Button: Complete Your Order\]\s*$/,'');
+          var hasCheckoutButton=/\\n*\[Button: Complete Your Order\]\s*$/.test(raw);raw=raw.replace(/\\n*\[Button: Complete Your Order\]\s*$/,'');
           body.textContent=raw;var meta=document.createElement('span');meta.className='msg-meta';var time=document.createElement('span');time.textContent=formatMessageTime(message.created_at);meta.appendChild(time);
           if(message.direction==='out'){var status=String(message.delivery_status||'sent');var ticks=document.createElement('span');ticks.className='ticks '+status;ticks.title=status.charAt(0).toUpperCase()+status.slice(1);ticks.textContent=status==='failed'?'!':(status==='sent'?'✓':'✓✓');meta.appendChild(ticks)}
           bubble.appendChild(body);
@@ -5881,10 +5950,9 @@ function adminInboxHtml(): string {
     syncButton.addEventListener('click',async function(){
       syncButton.disabled=true;
       try{
-        var data=await api('/admin/api/run-abandoned',{method:'POST'});
-        var counts=data.counts||{};
-        showStatus('New checkouts synced · reminders '+(counts.remindersAccepted||0)+' · active '+(counts.pending||0)+' · completed '+(counts.sent||0)+' · failed '+(counts.failed||0));
         await loadChats();
+        if(selectedPhone) await loadMessages(false);
+        showStatus('Inbox refreshed');
       }catch(error){showStatus(error.message)}
       finally{syncButton.disabled=false}
     });
