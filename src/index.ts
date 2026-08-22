@@ -621,41 +621,63 @@ app.get("/admin/api/messages", async (c) => {
     return c.json({ ok: false, error: "Invalid phone number" }, 400);
   }
 
-  const result = await c.env.DB.prepare(`
-    SELECT c.id, c.phone, c.direction, c.body, c.whatsapp_message_id,
-           c.delivery_status, c.status_updated_at, c.created_at,
-           e.stage AS abandoned_stage, e.template_name, e.destination_url,
-           e.clicked_at, e.purchased_at, e.error_code, e.error_message
-    FROM conversations c
-    LEFT JOIN abandoned_message_events e
-      ON e.message_id = c.whatsapp_message_id
-    WHERE c.phone = ?
-    ORDER BY c.id ASC
-    LIMIT 500
-  `)
-    .bind(phone)
-    .all();
+  const phoneLast10 = phone.slice(-10);
+  let messageRows: Record<string, unknown>[] = [];
+  try {
+    const tracked = await c.env.DB.prepare(`
+      SELECT c.id, c.phone, c.direction, c.body, c.whatsapp_message_id,
+             c.delivery_status, c.status_updated_at, c.created_at,
+             e.stage AS abandoned_stage, e.template_name, e.destination_url,
+             e.clicked_at, e.purchased_at, e.error_code, e.error_message
+      FROM conversations c
+      LEFT JOIN abandoned_message_events e
+        ON e.message_id = c.whatsapp_message_id
+      WHERE c.phone = ?
+         OR substr(replace(replace(replace(replace(replace(c.phone, '+', ''), ' ', ''), '-', ''), '(', ''), ')', ''), -10) = ?
+      ORDER BY c.id ASC
+      LIMIT 500
+    `).bind(phone, phoneLast10).all<Record<string, unknown>>();
+    messageRows = tracked.results ?? [];
+  } catch (error) {
+    console.error("Tracked admin chat lookup failed; using plain history:", error);
+    const plain = await c.env.DB.prepare(`
+      SELECT id, phone, direction, body, whatsapp_message_id,
+             delivery_status, status_updated_at, created_at,
+             NULL AS abandoned_stage, NULL AS template_name,
+             NULL AS destination_url, NULL AS clicked_at,
+             NULL AS purchased_at, NULL AS error_code, NULL AS error_message
+      FROM conversations
+      WHERE phone = ?
+         OR substr(replace(replace(replace(replace(replace(phone, '+', ''), ' ', ''), '-', ''), '(', ''), ')', ''), -10) = ?
+      ORDER BY id ASC
+      LIMIT 500
+    `).bind(phone, phoneLast10).all<Record<string, unknown>>();
+    messageRows = plain.results ?? [];
+  }
 
   const contact = await c.env.DB.prepare(`
     SELECT COALESCE(NULLIF(ct.profile_name, ''), NULLIF((
       SELECT a.customer_name
       FROM abandoned_checkouts a
       WHERE a.phone = ?
+         OR substr(replace(replace(replace(replace(replace(a.phone, '+', ''), ' ', ''), '-', ''), '(', ''), ')', ''), -10) = ?
       ORDER BY a.updated_at DESC
       LIMIT 1
     ), ''), ?) AS customer_name
     FROM (SELECT 1) seed
-    LEFT JOIN contacts ct ON ct.phone = ?
+    LEFT JOIN contacts ct
+      ON ct.phone = ?
+      OR substr(replace(replace(replace(replace(replace(ct.phone, '+', ''), ' ', ''), '-', ''), '(', ''), ')', ''), -10) = ?
     LIMIT 1
   `)
-    .bind(phone, phone, phone)
+    .bind(phone, phoneLast10, phone, phone, phoneLast10)
     .first<{ customer_name: string }>();
 
   return c.json({
     ok: true,
     phone,
     customerName: contact?.customer_name || phone,
-    messages: result.results ?? [],
+    messages: messageRows,
   });
 });
 
@@ -5923,7 +5945,9 @@ export function adminInboxHtml(): string {
       try{
         var data=await api('/admin/api/messages?phone='+encodeURIComponent(selectedPhone));
         selectedName=data.customerName || selectedName;document.getElementById('headerName').textContent=selectedName;document.getElementById('headerAvatar').textContent=initials(selectedName);
-        messages.innerHTML='';(data.messages || []).forEach(function(message){
+        var history=data.messages || [];messages.innerHTML='';
+        if(!history.length){var empty=document.createElement('div');empty.className='empty';empty.textContent='No saved messages found for this customer';messages.appendChild(empty)}
+        history.forEach(function(message){
           var row=document.createElement('div');row.className='row '+(message.direction==='out'?'out':'in');
           var bubble=document.createElement('div');bubble.className='bubble';var body=document.createElement('div');
           var raw=String(message.body || '');var imageMatch=raw.match(/^\\[image:(https:\\/\\/[^\\]]+)\\]\\s*/);
@@ -5937,7 +5961,7 @@ export function adminInboxHtml(): string {
           bubble.appendChild(meta);row.appendChild(bubble);messages.appendChild(row);
         });
         if(scroll) messages.scrollTop=messages.scrollHeight;
-      }catch(error){showStatus(error.message)}finally{loadingMessages=false}
+      }catch(error){messages.innerHTML='';var failed=document.createElement('div');failed.className='empty';failed.textContent='Chat history could not load. '+error.message;messages.appendChild(failed);showStatus(error.message)}finally{loadingMessages=false}
     }
     composer.addEventListener('submit',async function(event){
       event.preventDefault();var body=messageInput.value.trim();if(!body || !selectedPhone) return;
