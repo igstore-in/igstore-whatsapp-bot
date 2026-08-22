@@ -233,6 +233,8 @@ describe("priority WhatsApp flows", () => {
     expect(script).toBeTruthy();
     expect(() => new Function(script!)).not.toThrow();
     expect(html).toContain("Inbox refreshed");
+    expect(html).toContain("No saved messages found for this customer");
+    expect(html).toContain("Chat history could not load");
     expect(html).not.toContain("api('/admin/api/run-abandoned'");
   });
 
