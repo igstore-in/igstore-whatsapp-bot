@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   ABANDONED_NEW_ONLY_SINCE,
   adminInboxHtml,
+  abandonedCheckoutSearchQuery,
   abandonedDestinationUrl,
   abandonedRecoveryButtonSuffix,
   allOrderVariants,
@@ -289,6 +290,17 @@ describe("priority WhatsApp flows", () => {
     expect(hasWhatsAppMarketingConsent({
       note_attributes: [{ name: "WhatsApp opt in", value: "yes" }],
     })).toBe(true);
+    expect(hasWhatsAppMarketingConsent({
+      note_attributes: [{ name: "WhatsApp cart reminder opt in", value: "on" }],
+    })).toBe(true);
+    expect(hasWhatsAppMarketingConsent({
+      note_attributes: [{ name: "WhatsApp cart reminder opt in", value: "no" }],
+    })).toBe(false);
+  });
+
+  it("quotes the Shopify abandoned-checkout cutoff timestamp", () => {
+    expect(abandonedCheckoutSearchQuery("2026-08-22T08:06:01.120Z"))
+      .toBe("created_at:>='2026-08-22T08:06:01.120Z'");
   });
 
   it("subscribes to cart, checkout, purchase and fulfillment lifecycle webhooks", () => {
