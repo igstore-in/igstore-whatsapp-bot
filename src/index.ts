@@ -2645,12 +2645,17 @@ export function hasWhatsAppMarketingConsent(payload: any): boolean {
   return attributes.some((attribute: any) => {
     const name = normalize(String(attribute?.name ?? ""));
     const value = normalize(String(attribute?.value ?? ""));
-    const consentField =
-      name === "whatsapp opt in" ||
-      name === "whatsapp_opt_in" ||
-      name === "whatsapp marketing consent";
+    const consentField = [
+      "whatsapp opt in",
+      "whatsapp marketing opt in",
+      "whatsapp marketing consent",
+      "whatsapp cart reminder opt in",
+      "whatsapp abandoned checkout opt in",
+      "receive whatsapp reminders",
+    ].includes(name);
 
-    return consentField && ["yes", "true", "1", "accepted"].includes(value);
+    return consentField &&
+      ["yes", "true", "1", "accepted", "subscribed", "on", "checked"].includes(value);
   });
 }
 
@@ -3142,6 +3147,11 @@ async function ensureShopifyWebhookSubscriptions(
   }
 }
 
+export function abandonedCheckoutSearchQuery(createdSince: string): string {
+  const safeCreatedSince = createdSince.replace(/'/g, "").trim();
+  return `created_at:>='${safeCreatedSince}'`;
+}
+
 export function nextAbandonedReminderAt(stage: number, sentAt: number): number {
   if (stage <= 1) {
     return sentAt +
@@ -3176,10 +3186,7 @@ async function syncAbandonedCheckoutsFromShopify(env: Bindings): Promise<void> {
           updatedAt
           customer {
             firstName
-            defaultPhoneNumber {
-              phoneNumber
-              whatsAppMarketingConsent { state updatedAt }
-            }
+            defaultPhoneNumber { phoneNumber }
           }
           shippingAddress { firstName phone }
           totalPriceSet { shopMoney { amount currencyCode } }
@@ -3218,7 +3225,7 @@ async function syncAbandonedCheckoutsFromShopify(env: Bindings): Promise<void> {
             variables: {
               first: ABANDONED_SYNC_PAGE_SIZE,
               after,
-              query: `created_at:>=${createdSince}`,
+              query: abandonedCheckoutSearchQuery(createdSince),
             },
           }),
         },
@@ -3255,8 +3262,6 @@ async function syncAbandonedCheckoutsFromShopify(env: Bindings): Promise<void> {
           total_price: money?.amount,
           currency: money?.currencyCode,
           phone: phoneRecord?.phoneNumber ?? checkout?.shippingAddress?.phone,
-          whatsapp_marketing_consent_state:
-            String(phoneRecord?.whatsAppMarketingConsent?.state ?? ""),
           customer: { first_name: checkout?.customer?.firstName },
           shipping_address: {
             first_name: checkout?.shippingAddress?.firstName,
@@ -3304,10 +3309,7 @@ async function syncMarketingCustomers(env: Bindings): Promise<void> {
           id
           displayName
           numberOfOrders
-          defaultPhoneNumber {
-            phoneNumber
-            whatsAppMarketingConsent { state updatedAt }
-          }
+          defaultPhoneNumber { phoneNumber }
         }
         pageInfo { hasNextPage endCursor }
       }
@@ -3353,8 +3355,7 @@ async function syncMarketingCustomers(env: Bindings): Promise<void> {
       );
       if (!phone) continue;
       const optedIn =
-        String(customer?.defaultPhoneNumber?.whatsAppMarketingConsent?.state ?? "").toUpperCase() ===
-          "SUBSCRIBED" &&
+        (await hasStoredWhatsAppMarketingConsent(env, phone)) &&
         !(await isWhatsAppMarketingOptedOut(env, phone));
       await env.DB.prepare(`
         INSERT INTO marketing_contacts (
